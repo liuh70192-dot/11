@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Turrit任务助手</string>
+    <string name="accessibility_description">在你明确启动任务后，辅助切换 Turrit 账号、查找指定机器人并发送预设文字。不会读取登录密码。</string>
+</resources>
