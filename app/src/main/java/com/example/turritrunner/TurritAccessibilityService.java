@@ -17,10 +17,11 @@ import android.view.accessibility.AccessibilityNodeInfo;
 
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.Set;
 
 /**
@@ -42,6 +43,13 @@ public class TurritAccessibilityService extends AccessibilityService {
     private DiscoverResult discoverCallback;
     private boolean inDiscovery;
     private int screenW = 1080, screenH = 1920;
+    // 每次扫描最多执行四次手势；账号数由 Turrit 的「6/10」等计数决定。
+    private int expectedAccountCount = -1;
+    private int noProgressSwipes = 0;
+    private String previousScanSignature = "";
+    private static final int MAX_ACCOUNT_SWIPES = 4;
+    private static final Pattern ACCOUNT_COUNTER = Pattern.compile("^(\\d{1,2})\\s*/\\s*10$");
+
 
     public static TurritAccessibilityService current() { return active; }
     public boolean isBusy() { return busy; }
@@ -73,15 +81,16 @@ public class TurritAccessibilityService extends AccessibilityService {
 
     public void discover(DiscoverResult cb) {
         h.post(() -> {
-            if (busy) { cb.done(Collections.emptyList(), "正在执行任务，无法同时识别账号"); return; }
+            if (busy) { cb.done(Collections.emptyList(), "正在执行任务"); return; }
             busy = true; cancelled = false; inDiscovery = true;
-            discoverCallback = cb; discovered.clear();
-            if (!launchTurrit()) { finishDiscover("无法启动 Turrit：请确认已安装官方包 org.telegram.group"); return; }
+            discoverCallback = cb; discovered.clear(); expectedAccountCount = -1;
+            noProgressSwipes = 0; previousScanSignature = "";
+            if (!launchTurrit()) { finishDiscover("无法启动 Turrit"); return; }
             after(1100, () -> {
-                if (!goMe()) { finishDiscover("未能进入 Turrit 的「我的」页面"); return; }
-                after(650, () -> {
+                if (!goMe()) { finishDiscover("无法打开 Turrit 的「我的」页面"); return; }
+                after(550, () -> {
                     expandAccounts();
-                    after(450, () -> sweepAccounts(0, 0));
+                    after(500, () -> moveAccountListToTop(0));
                 });
             });
         });
@@ -94,25 +103,50 @@ public class TurritAccessibilityService extends AccessibilityService {
         Store.get(this).log("识别账号：" + result.size() + " 个；" + detail);
         if (cb != null) cb.done(result, detail);
     }
-    private void sweepAccounts(int step, int phase) {
+    private void moveAccountListToTop(int attempt) {
         if (cancelled) { finishDiscover("已取消"); return; }
-        if (!isTurritForeground()) { finishDiscover("当前前台不是 Turrit"); return; }
-        collectAccountLabels(discovered);
-        if (step >= 8) {
-            if (phase == 0) {
-                // 某些版本会从中间位置展开；往回滑，再扫描一遍。
-                swipe(screenW * .48f, screenH * .37f, screenW * .48f, screenH * .58f);
-                after(450, () -> sweepAccounts(0, 1));
-                return;
-            }
-            finishDiscover(discovered.isEmpty() ?
-                "未读取到账号文本。可尝试手动添加账号；Turrit 版本可能不暴露无障碍文本。" :
-                "扫描结束；如果部分账号遗漏，可再次识别或手动添加。 ");
-            return;
+        if (!isTurritForeground()) { finishDiscover("Turrit 不在前台"); return; }
+        if (findAddAccountNode() == null) {
+            finishDiscover("账号列表未展开，请在 Turrit 的「我的」页展开账号列表后重试"); return;
         }
-        swipe(screenW * .48f, phase == 0 ? screenH * .58f : screenH * .37f,
-              screenW * .48f, phase == 0 ? screenH * .34f : screenH * .58f);
-        after(480, () -> sweepAccounts(step + 1, phase));
+        // 向下拉回账号列表顶部，保证当前账户不会因为页面已经滚动而遗漏。
+        if (profileHeaderLabel() != null || attempt >= 2) {
+            sweepAccounts(0); return;
+        }
+        swipeAccountListTowardTop();
+        after(520, () -> moveAccountListToTop(attempt + 1));
+    }
+    private void sweepAccounts(int swipes) {
+        if (cancelled) { finishDiscover("已取消"); return; }
+        if (!isTurritForeground()) { finishDiscover("Turrit 不在前台"); return; }
+        AccountSnapshot snapshot = accountSnapshot();
+        if (!snapshot.valid) {
+            finishDiscover("未找到「添加账号」边界，已停止扫描，避免识别到设置菜单"); return;
+        }
+        if (snapshot.total > 0) expectedAccountCount = snapshot.total;
+        int previous = discovered.size();
+        discovered.addAll(snapshot.names);
+        String signature = snapshot.signature();
+        if (previous == discovered.size() || signature.equals(previousScanSignature)) noProgressSwipes++;
+        else noProgressSwipes = 0;
+        previousScanSignature = signature;
+        if (expectedAccountCount > 0 && discovered.size() >= expectedAccountCount) {
+            finishDiscover("已读取到 Turrit 显示的 " + expectedAccountCount + " 个账号"); return;
+        }
+        if (swipes >= MAX_ACCOUNT_SWIPES || noProgressSwipes >= 2) {
+            String detail = expectedAccountCount > discovered.size() ?
+                "停止滑动：Turrit 显示 " + expectedAccountCount + " 个，当前识别 " + discovered.size() + " 个；请核对" :
+                "扫描结束，已停止自动滑动";
+            finishDiscover(detail); return;
+        }
+        // 只在账号列表区域滑动，不再连续十几次滑过整个设置页。
+        float bottom = Math.min(screenH * .66f, snapshot.addTop - screenH * .02f);
+        float top = Math.max(screenH * .085f, bottom - screenH * .17f);
+        if (bottom - top < screenH * .06f) {
+            finishDiscover("账号列表已到边界，停止滑动"); return;
+        }
+        swipe(screenW * .43f, bottom, screenW * .43f, top);
+        after(530, () -> sweepAccounts(swipes + 1));
     }
 
     /** 实际发送仅在页面识别成功后继续；单账号「立即测试」为不发送的安全检查。 */
@@ -139,7 +173,7 @@ public class TurritAccessibilityService extends AccessibilityService {
                 if (!goMe()) { finish(false, "无法定位底部「我的」页面"); return; }
                 after(550, () -> {
                     expandAccounts();
-                    after(450, () -> chooseAccount(0, 0, dryRun));
+                    after(450, () -> prepareAccountSelection(0, dryRun));
                 });
             });
         });
@@ -181,36 +215,66 @@ public class TurritAccessibilityService extends AccessibilityService {
         if (arrow != null && click(arrow)) return;
         tap(screenW * .915f, screenH * .21f);
     }
+    private void prepareAccountSelection(int attempt, boolean dryRun) {
+        if (!isTurritForeground()) { finish(false, "Turrit 已离开前台"); return; }
+        if (findAddAccountNode() == null) {
+            finish(false, "未找到展开的账号列表，请手动展开一次"); return;
+        }
+        if (profileHeaderLabel() != null || attempt >= 2) {
+            chooseAccount(0, 0, dryRun); return;
+        }
+        swipeAccountListTowardTop();
+        after(520, () -> prepareAccountSelection(attempt + 1, dryRun));
+    }
+    private void swipeAccountListTowardTop() {
+        AccessibilityNodeInfo add = findAddAccountNode();
+        int y = Math.round(screenH * .64f);
+        if (add != null) {
+            Rect b = new Rect(); add.getBoundsInScreen(b);
+            y = b.top - Math.round(screenH * .02f);
+        }
+        float from = Math.max(screenH * .095f, Math.min(screenH * .43f, y - screenH * .16f));
+        float to = Math.min(screenH * .70f, from + screenH * .17f);
+        swipe(screenW * .43f, from, screenW * .43f, to);
+    }
     private boolean headerIsAccount(String label) {
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        return findTextRec(root, label, .14f, .295f, true) != null;
+        // 只有可见的 @username + 上方姓名构成个人资料头，绝不把列表首项当作当前账号。
+        String header = profileHeaderLabel();
+        return header != null && header.equals(label);
     }
     private void chooseAccount(int step, int phase, boolean dryRun) {
         if (!isTurritForeground()) { finish(false, "当前不是 Turrit 界面"); return; }
         if (headerIsAccount(targetLabel)) { openBot(dryRun); return; }
-        AccessibilityNodeInfo node = findTextRec(getRootInActiveWindow(), targetLabel, .29f, .70f, true);
+        AccountSnapshot snapshot = accountSnapshot();
+        if (!snapshot.valid) { finish(false, "未找到展开的账号列表，已停止切换"); return; }
+        AccessibilityNodeInfo node = findAccountRow(targetLabel, snapshot.addTop);
         if (node != null) {
-            if (!click(node)) { finish(false, "账号行不可点击：" + targetLabel); return; }
+            if (!click(node)) { finish(false, "账号无法点击：" + targetLabel); return; }
             after(900, () -> {
-                // 切换后通常回到聊天页面；重复进入「我的」验证当前账号。
-                if (!goMe()) { finish(false, "切换后无法验证账号"); return; }
-                after(550, () -> {
-                    if (headerIsAccount(targetLabel)) openBot(dryRun);
-                    else finish(false, "切换账号验证失败，已阻止发送：" + targetLabel);
-                });
+                if (!goMe()) { finish(false, "切换后无法打开个人资料页"); return; }
+                after(550, () -> verifySwitchedAccount(0, dryRun));
             });
             return;
         }
-        if (step >= 9) {
-            if (phase == 0) {
-                swipe(screenW * .48f, screenH * .36f, screenW * .48f, screenH * .58f);
-                after(450, () -> chooseAccount(0, 1, dryRun));
-            } else finish(false, "账号列表已上下搜索，未找到：" + targetLabel);
+        if (step >= MAX_ACCOUNT_SWIPES) {
+            finish(false, "已停止滑动：账号列表中未找到「" + targetLabel + "」");
             return;
         }
-        swipe(screenW * .48f, phase == 0 ? screenH * .59f : screenH * .35f,
-              screenW * .48f, phase == 0 ? screenH * .35f : screenH * .59f);
-        after(430, () -> chooseAccount(step + 1, phase, dryRun));
+        // 如果从上往下未找到，只回拉一次再重新寻找。
+        float bottom = Math.min(screenH * .66f, snapshot.addTop - screenH * .02f);
+        float top = Math.max(screenH * .085f, bottom - screenH * .17f);
+        if (bottom - top < screenH * .06f) {
+            finish(false, "账号列表已到边界，无法继续搜索：" + targetLabel); return;
+        }
+        swipe(screenW * .43f, bottom, screenW * .43f, top);
+        after(500, () -> chooseAccount(step + 1, phase, dryRun));
+    }
+    private void verifySwitchedAccount(int attempt, boolean dryRun) {
+        if (!isTurritForeground()) { finish(false, "切换账号后离开 Turrit"); return; }
+        if (headerIsAccount(targetLabel)) { openBot(dryRun); return; }
+        if (attempt >= 2) { finish(false, "无法验证当前账号，已阻止发送：" + targetLabel); return; }
+        swipeAccountListTowardTop();
+        after(520, () -> verifySwitchedAccount(attempt + 1, dryRun));
     }
 
     private void openBot(boolean dryRun) {
@@ -357,27 +421,112 @@ public class TurritAccessibilityService extends AccessibilityService {
         }
         return null;
     }
-    private void collectAccountLabels(Set<String> out) {
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        Set<String> excludes = new HashSet<>();
-        Collections.addAll(excludes, "添加账号", "我的", "收藏夹", "下载", "实用工具",
-            "聊天", "联系人", "发现", "设置", "扫一扫", "编辑资料", "My", "Add Account");
-        collectLabelNodes(root, out, excludes);
+    /** 账号边界：只读取「添加账号」上方的账号行；永远不读它下方的设置、缓存、客服等菜单。 */
+    private static class AccountSnapshot {
+        boolean valid;
+        int total = -1;
+        int addTop;
+        final Set<String> names = new LinkedHashSet<>();
+        String signature() { return names.toString() + "|" + addTop; }
     }
-    private void collectLabelNodes(AccessibilityNodeInfo node, Set<String> out, Set<String> excludes) {
-        if (node == null) return;
-        Rect r = new Rect(); node.getBoundsInScreen(r);
-        String content = readText(node).trim();
-        if (content.isEmpty() && node.getChildCount() == 0)
-            content = safe(node.getContentDescription()).trim();
-        // 取正文账号区域中的文字，排除右侧蓝色未读数字徽章。
-        if (node.isVisibleToUser() && !content.isEmpty()
-            && r.centerY() >= screenH * .29f && r.centerY() <= screenH * .69f
-            && r.centerX() >= screenW * .105f && r.centerX() <= screenW * .82f
-            && content.length() <= 50 && !content.contains("\n") && !excludes.contains(content)) {
-            out.add(content);
+    private AccessibilityNodeInfo findAddAccountNode() {
+        return findTextRec(getRootInActiveWindow(), "添加账号", .06f, .82f, true);
+    }
+    private String profileHeaderLabel() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return null;
+        List<AccessibilityNodeInfo> leaves = new ArrayList<>();
+        collectTextLeaves(root, leaves);
+        AccessibilityNodeInfo username = null;
+        for (AccessibilityNodeInfo node : leaves) {
+            Rect r = new Rect(); node.getBoundsInScreen(r);
+            String value = readText(node).trim();
+            if (value.matches("@[A-Za-z0-9_]{3,32}") && r.centerY() > screenH * .10f
+                    && r.centerY() < screenH * .34f && r.centerX() < screenW * .79f) {
+                username = node; break;
+            }
         }
-        for (int i = 0; i < node.getChildCount(); i++) collectLabelNodes(node.getChild(i), out, excludes);
+        if (username == null) return null;
+        Rect userR = new Rect(); username.getBoundsInScreen(userR);
+        String selected = null;
+        int bestDist = Integer.MAX_VALUE;
+        for (AccessibilityNodeInfo node : leaves) {
+            Rect r = new Rect(); node.getBoundsInScreen(r);
+            String value = readText(node).trim();
+            int dist = userR.centerY() - r.centerY();
+            if (dist > 0 && dist < screenH * .10f && dist < bestDist
+                    && r.centerX() > screenW * .18f && r.centerX() < screenW * .75f
+                    && validAccountName(value)) { selected = value; bestDist = dist; }
+        }
+        return selected;
+    }
+    private AccountSnapshot accountSnapshot() {
+        AccountSnapshot shot = new AccountSnapshot();
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        AccessibilityNodeInfo add = findAddAccountNode();
+        if (root == null || add == null) return shot;
+        Rect addR = new Rect(); add.getBoundsInScreen(addR);
+        shot.addTop = addR.top;
+        shot.valid = true;
+        List<AccessibilityNodeInfo> leaves = new ArrayList<>();
+        collectTextLeaves(root, leaves);
+        String header = profileHeaderLabel();
+        if (header != null) shot.names.add(header);
+        int minY = Math.round(screenH * .085f);
+        for (AccessibilityNodeInfo node : leaves) {
+            Rect r = new Rect(); node.getBoundsInScreen(r);
+            String value = readText(node).trim();
+            if (value.matches("@[A-Za-z0-9_]{3,32}") && r.centerY() < screenH * .34f) {
+                minY = Math.max(minY, r.bottom + Math.round(screenH * .025f));
+            }
+            Matcher count = ACCOUNT_COUNTER.matcher(value);
+            if (count.matches() && r.centerX() > screenW * .70f) {
+                shot.total = Math.min(10, Integer.parseInt(count.group(1)));
+            }
+        }
+        for (AccessibilityNodeInfo node : leaves) {
+            Rect r = new Rect(); node.getBoundsInScreen(r);
+            String value = readText(node).trim();
+            if (r.centerY() <= minY || r.centerY() >= shot.addTop - screenH * .010f) continue;
+            if (r.centerX() < screenW * .13f || r.centerX() > screenW * .80f) continue;
+            if (validAccountName(value)) shot.names.add(value);
+        }
+        return shot;
+    }
+    private AccessibilityNodeInfo findAccountRow(String wanted, int addTop) {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        List<AccessibilityNodeInfo> leaves = new ArrayList<>();
+        collectTextLeaves(root, leaves);
+        int minY = Math.round(screenH * .085f);
+        for (AccessibilityNodeInfo node : leaves) {
+            Rect r = new Rect(); node.getBoundsInScreen(r);
+            if (readText(node).trim().matches("@[A-Za-z0-9_]{3,32}") && r.centerY() < screenH * .34f)
+                minY = Math.max(minY, r.bottom + Math.round(screenH * .025f));
+        }
+        for (AccessibilityNodeInfo node : leaves) {
+            Rect r = new Rect(); node.getBoundsInScreen(r);
+            if (readText(node).trim().equals(wanted) && r.centerY() > minY
+                    && r.centerY() < addTop - screenH * .010f
+                    && r.centerX() > screenW * .13f && r.centerX() < screenW * .80f) return node;
+        }
+        return null;
+    }
+    private void collectTextLeaves(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> out) {
+        if (node == null) return;
+        if (node.isVisibleToUser() && node.getChildCount() == 0 && node.getText() != null)
+            out.add(node);
+        for (int i = 0; i < node.getChildCount(); i++) collectTextLeaves(node.getChild(i), out);
+    }
+    private boolean validAccountName(String value) {
+        if (value.isEmpty() || value.length() > 40 || value.contains("\n") || value.startsWith("@")) return false;
+        if (value.matches("\\d+\\s*/\\d+") || value.contains("添加账号")) return false;
+        switch (value) {
+            case "我的": case "Me": case "添加账号": case "Add Account":
+            case "聊天": case "联系人": case "发现": case "下载": case "缓存":
+            case "实用工具": case "收藏夹": case "设置": case "客服":
+                return false;
+            default: return true;
+        }
     }
     private boolean click(AccessibilityNodeInfo node) {
         for (AccessibilityNodeInfo current = node; current != null; current = current.getParent()) {

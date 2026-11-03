@@ -50,6 +50,8 @@ public class MainActivity extends Activity {
     private Spinner countMode;
     private int page = 0;
     private boolean visible;
+    private List<String> pendingDetectedAccounts;
+    private String pendingDetectedDetail;
     private final Runnable heartbeat = new Runnable() {
         @Override public void run() {
             if (!visible) return;
@@ -70,6 +72,7 @@ public class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume(); visible = true;
         render(); h.removeCallbacks(heartbeat); h.post(heartbeat);
+        h.post(this::showPendingDetectedAccounts);
     }
     @Override protected void onPause() {
         visible = false;
@@ -151,7 +154,7 @@ public class MainActivity extends Activity {
         banner.setPadding(dp(18), dp(12), dp(18), dp(14)); banner.setBackgroundColor(NAVY);
         add(banner, text("Turrit 任务助手", 21f, Color.WHITE, true), -1, -2);
         gap(banner, 6);
-        headline = text(buildStatusText(), 12f, Color.rgb(201, 217, 240), false);
+        headline = text(buildStatusText(), 14f, Color.rgb(222, 232, 247), true);
         add(banner, headline, -1, -2);
         add(root, banner, -1, -2);
 
@@ -168,10 +171,7 @@ public class MainActivity extends Activity {
         boolean running = store != null && store.isRunning() && SchedulerService.alive;
         int done = store == null ? 0 : store.countStatus("完成");
         int fail = store == null ? 0 : store.countStatus("失败");
-        Store.Job next = store == null ? null : store.nextWaiting();
-        String when = next == null ? "暂无任务" : Store.fmt(next.due);
-        return (running ? "● 运行中" : "○ 已停止") + "    完成 " + done + "    失败 " + fail +
-            "\n下次任务：" + (running ? when : "等待手动开始");
+        return (running ? "● 运行中" : "○ 已停止") + "   成功 " + done + "   失败 " + fail;
     }
     private void render() {
         if (body == null) return;
@@ -197,9 +197,6 @@ public class MainActivity extends Activity {
 
     private void overview() {
         LinearLayout top = card("运行控制");
-        add(top, text("启动后才生成未来 24 小时的随机任务。关闭 MuMu 后停止；重新打开须手动开始。",
-            12.5f, MUTED, false), -1, -2);
-        gap(top, 13);
         LinearLayout actions = row();
         Button go = primary("▶ 开始任务"); Button stop = neutral("■ 停止任务");
         weighted(actions, go); weighted(actions, stop);
@@ -217,9 +214,6 @@ public class MainActivity extends Activity {
         int enabled = 0; for (Store.Account a : accounts) if (a.enabled) enabled++;
         add(stats, text("已添加账号 " + accounts.size() + "  ·  启用 " + enabled +
                 "  ·  消息 " + store.messages().size() + " 条", 14, NAVY, false), -1, -2);
-        gap(stats, 6);
-        add(stats, text("每日每账号 " + store.perAccountDaily() + " 次  ·  每次 " +
-                (store.countMode() == 0 ? "随机 1–2 条" : store.countMode() + " 条"), 12, MUTED, false), -1, -2);
         gap(stats, 11);
         Store.Job next = store.nextWaiting();
         add(stats, text("下次：" + (next == null ? "启动后自动安排" :
@@ -273,9 +267,6 @@ public class MainActivity extends Activity {
 
     private void accountPage() {
         LinearLayout actions = card("账号管理");
-        add(actions, text("自动识别 Turrit 已登录账号；支持上下滑动查找。识别期间会切换到 Turrit。",
-            12, MUTED, false), -1, -2);
-        gap(actions, 10);
         LinearLayout bar = row();
         Button auto = primary("识别 Turrit 账号"); Button manual = neutral("手动添加");
         weighted(bar, auto); weighted(bar, manual); add(actions, bar, -1, -2);
@@ -304,20 +295,44 @@ public class MainActivity extends Activity {
             test.setOnClickListener(v -> testAccount(a));
             add(list, one, -1, -2); gap(list, 5);
         }
-        gap(list, 8);
-        add(list, text("测试只检查账号切换与机器人页面，不发送任何文字。账号名称应与 Turrit 中显示一致。",
-                11.5f, MUTED, false), -1, -2);
     }
     private void detectAccounts() {
         TurritAccessibilityService s = TurritAccessibilityService.current();
         if (s == null) { toast("请先开启无障碍服务"); return; }
-        toast("正在读取 Turrit 账号列表；扫描结束后返回 APK 查看结果");
+        toast("正在识别账号");
         s.discover((names, detail) -> runOnUiThread(() -> {
-            int newCount = store.mergeFoundAccounts(names);
-            store.log("发现 " + names.size() + " 个候选，新增 " + newCount + " 个；请核对");
-            toast("扫描到 " + names.size() + " 个候选，新增 " + newCount + " 个");
-            if (visible) render();
+            // 扫描时 APK 在后台，先暂存结果；用户返回 APK 再显示核对框。
+            pendingDetectedAccounts = new ArrayList<>(names);
+            pendingDetectedDetail = detail;
+            if (visible) showPendingDetectedAccounts();
         }));
+    }
+    private void showPendingDetectedAccounts() {
+        if (!visible || pendingDetectedAccounts == null) return;
+        List<String> names = pendingDetectedAccounts;
+        String detail = pendingDetectedDetail;
+        pendingDetectedAccounts = null;
+        pendingDetectedDetail = null;
+        if (names.isEmpty()) {
+            store.log("识别未成功：" + detail);
+            new AlertDialog.Builder(this).setTitle("未识别到账号")
+                .setMessage(detail).setPositiveButton("知道了", null).show();
+            return;
+        }
+        String[] labels = names.toArray(new String[0]);
+        boolean[] selected = new boolean[labels.length];
+        java.util.Arrays.fill(selected, true);
+        new AlertDialog.Builder(this).setTitle("核对账号（" + labels.length + "）")
+            .setMessage(detail + "\n取消勾选错误账号后再保存。")
+            .setMultiChoiceItems(labels, selected, (dialog, index, checked) -> selected[index] = checked)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("保存账号", (dialog, which) -> {
+                List<String> approved = new ArrayList<>();
+                for (int i = 0; i < labels.length; i++) if (selected[i]) approved.add(labels[i]);
+                store.replaceFoundAccounts(approved);
+                store.log("已核对并保存 " + approved.size() + " 个账号");
+                render();
+            }).show();
     }
     private void manualAccount() {
         EditText name = input("输入 Turrit 账号列表显示的准确名称", "", InputType.TYPE_CLASS_TEXT);
@@ -369,9 +384,6 @@ public class MainActivity extends Activity {
     }
     private void messagePage() {
         LinearLayout card = card("共用文字消息库");
-        add(card, text("仅支持 TXT 文本；一行一条消息。10 个账号共用一个消息池，随机抽取，本轮用完前不重复。",
-             12.5f, MUTED, false), -1, -2);
-        gap(card, 12);
         LinearLayout buttons = row();
         Button choose = primary("导入 TXT 文件"); Button clear = neutral("清空消息库");
         weighted(buttons, choose); weighted(buttons, clear);
@@ -442,14 +454,6 @@ public class MainActivity extends Activity {
         Button save = primary("保存任务设置"); add(box, save, -1, 43);
         save.setOnClickListener(v -> saveTasks());
 
-        LinearLayout note = card("随机调度规则");
-        add(note, text("点击「开始」后才为启用账号生成未来 24 小时的随机计划，每个账号按设置次数分布在各时间片。到期依次执行，同一时间只操作一个账号。",
-            12.5f, MUTED, false), -1, -2);
-        gap(note, 10);
-        add(note, text("某个任务失败直接跳过，不自动重试。下轮重新随机洗牌消息池。", 12.5f, MUTED, false), -1, -2);
-        gap(note, 10);
-        add(note, text("修改配置后，点击「停止」再「开始」，新的任务次数才会应用到计划。",
-            12.5f, BLUE, false), -1, -2);
     }
     private void saveTasks() {
         String bot = botInput.getText().toString().trim();

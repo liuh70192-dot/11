@@ -150,6 +150,22 @@ public final class Store {
         return newCount;
     }
 
+    /** 经用户确认后替换旧的识别列表；同名账户保留备注和启用状态。 */
+    public synchronized void replaceFoundAccounts(List<String> approved) {
+        List<Account> old = accounts();
+        List<Account> replacement = new ArrayList<>();
+        Set<String> unique = new HashSet<>();
+        for (String name : approved) {
+            if (name == null) continue;
+            name = name.trim();
+            if (name.isEmpty() || !unique.add(name)) continue;
+            Account kept = null;
+            for (Account a : old) if (a.label.equals(name)) { kept = a; break; }
+            replacement.add(kept != null ? kept : new Account(name, "", true));
+        }
+        saveAccounts(replacement);
+    }
+
     public static class Job {
         public String id, label, state, info;
         public long due;
