@@ -3,6 +3,9 @@ package com.example.turritrunner;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.content.Intent;
+import android.content.ComponentName;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.graphics.Path;
 import android.graphics.Rect;
 import android.net.Uri;
@@ -370,15 +373,65 @@ public class TurritAccessibilityService extends AccessibilityService {
 
     private void openBot(boolean dryRun) {
         if (!isTurritForeground()) { finish(false, "Turrit 不在前台"); return; }
-        // 显式把 Telegram deep link 交给 Turrit，避免浏览器或其它 Telegram 客户端劫持。
+        // 以前只 setPackage，若同一个 Turrit 应用有两个 tg:// 处理 Activity，
+        // Android 会弹出两个都叫“Turrit”的「打开方式」选择框，导致自动化中断。
+        // 这里解析实际处理该链接的 Activity，并显式定位其中一个；不更改默认应用。
         Uri address = Uri.parse("tg://resolve?domain=" + Uri.encode(botUser));
         Intent intent = new Intent(Intent.ACTION_VIEW, address);
         intent.setPackage(Store.TURRIT_PKG);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        ComponentName handler = selectTurritDeepLinkHandler(intent);
+        if (handler == null) {
+            finish(false, "没有找到 Turrit 可用的 tg:// 处理页面，已停止操作");
+            return;
+        }
+        intent.setComponent(handler);
         try { startActivity(intent); }
-        catch (Exception e) { finish(false, "Turrit 不支持该机器人直达链接：" + e.getClass().getSimpleName()); return; }
+        catch (Exception e) { finish(false, "Turrit 无法打开机器人页面：" + e.getClass().getSimpleName()); return; }
+        // 后续仍然校验机器人的顶部名称和聊天输入框，不会仅因打开了页面就发送。
         after(1550, () -> verifyChat(0, dryRun));
     }
+    /** 仅在 org.telegram.group 内选取支持 tg:// 的 Activity，避免弹出系统「打开方式」。 */
+    private ComponentName selectTurritDeepLinkHandler(Intent viewIntent) {
+        List<ResolveInfo> candidates;
+        try {
+            candidates = getPackageManager().queryIntentActivities(
+                    viewIntent, PackageManager.MATCH_DEFAULT_ONLY);
+        } catch (Exception error) {
+            Store.get(this).log("查询 Turrit tg 链接处理页面失败："
+                    + error.getClass().getSimpleName());
+            return null;
+        }
+        if (candidates == null || candidates.isEmpty()) return null;
+        Intent launcher = getPackageManager().getLaunchIntentForPackage(Store.TURRIT_PKG);
+        String launcherClass = launcher != null && launcher.getComponent() != null
+                ? launcher.getComponent().getClassName() : "";
+        ResolveInfo selected = null;
+        int bestScore = Integer.MIN_VALUE;
+        for (ResolveInfo candidate : candidates) {
+            if (candidate.activityInfo == null || !candidate.activityInfo.enabled
+                    || !candidate.activityInfo.exported
+                    || !Store.TURRIT_PKG.equals(candidate.activityInfo.packageName)) continue;
+            String name = candidate.activityInfo.name;
+            if (name == null || name.isEmpty()) continue;
+            String lowerName = name.toLowerCase(Locale.ROOT);
+            int score = 0;
+            if (name.equals(launcherClass)) score += 100;
+            if (lowerName.contains("launchactivity")) score += 60;
+            if (lowerName.contains("resolver") || lowerName.contains("chooser")) score -= 80;
+            // 同分时稳定选择字典序较小的实现，避免每次测试行为变化。
+            if (selected == null || score > bestScore ||
+                    (score == bestScore && name.compareTo(selected.activityInfo.name) < 0)) {
+                selected = candidate;
+                bestScore = score;
+            }
+        }
+        if (selected == null) return null;
+        Store.get(this).log("Turrit 直达机器人：固定使用 " + selected.activityInfo.name
+                + "（候选 " + candidates.size() + "）");
+        return new ComponentName(Store.TURRIT_PKG, selected.activityInfo.name);
+    }
+
     private void verifyChat(int attempt, boolean dryRun) {
         if (!isTurritForeground()) { finish(false, "打开机器人后，前台不是 Turrit"); return; }
         AccessibilityNodeInfo root = getRootInActiveWindow();

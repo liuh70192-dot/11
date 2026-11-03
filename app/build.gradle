@@ -8,8 +8,8 @@ android {
         applicationId 'com.example.turritrunner'
         minSdk 26
         targetSdk 32
-        versionCode 5
-        versionName '0.4.1-beta'
+        versionCode 6
+        versionName '0.4.2-beta'
     }
 
     compileOptions {
