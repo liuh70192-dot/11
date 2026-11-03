@@ -57,6 +57,9 @@ public class TurritAccessibilityService extends AccessibilityService {
     private static final int INITIAL_TOP_SWIPES = 3;
     private static final int MAX_ACCOUNT_SWIPES = 7;
     private static final int MAX_REVERSE_SWIPES = 3;
+    // 单账号选择：先有限次数回到列表顶部，再向下寻找。两次画面不变立即停止。
+    private static final int MAX_SELECT_TOP_SWIPES = 5;
+    private static final int MAX_SELECT_DOWN_SWIPES = 7;
 
     private static final Pattern ACCOUNT_COUNTER = Pattern.compile("^(\\d{1,2})\\s*/\\s*10$");
 
@@ -331,37 +334,56 @@ public class TurritAccessibilityService extends AccessibilityService {
     private void prepareAccountSelection(int attempt, boolean dryRun) {
         if (!isTurritForeground()) { finish(false, "Turrit 已离开前台"); return; }
         if (!accountSnapshot().valid) {
-            finish(false, "无法读取展开后的账号列表（无障碍节点缺失），已停止切换"); return;
+            finish(false, "无法读取展开后的账号列表，已停止切换"); return;
         }
-        if (profileHeaderLabel() != null || attempt >= 2) {
-            chooseAccount(0, 0, dryRun); return;
-        }
-        swipeAccountListTowardTop();
-        after(520, () -> prepareAccountSelection(attempt + 1, dryRun));
+        // 与识别账号不同，切换不能只从当前位置向下滚动。
+        // 用户可能上次停在底部（只看见「于你执念」和「添加账号」），目标在上面。
+        chooseAccount(0, 0, dryRun, "", 0);
     }
+
+    /**
+     * 从已展开的账号列表向顶部滚动：触摸起点必须落在【可见账号行】里。
+     * 不能依赖「添加账号」的位置决定是否允许回滑：列表滑到底后，添加账号在屏幕上方，
+     * 旧代码因为计算出负距离而放弃回滑，所以找不到顶部的账号。
+     */
     private boolean swipeAccountListTowardTop() {
-        AccessibilityNodeInfo add = findAddAccountNode();
-        int addTop = Math.round(screenH * .69f);
-        if (add != null) {
-            Rect b = new Rect(); add.getBoundsInScreen(b);
-            addTop = b.top;
-        }
-        // 只在「头像下方 ~ 添加账号上方」的账号列表内部滑动。
-        float to = Math.min(screenH * .69f, addTop - screenH * .04f);
-        float from = Math.max(screenH * .31f, to - screenH * .23f);
-        if (to - from < screenH * .09f) return false;
-        return swipe(screenW * .44f, from, screenW * .44f, to);
+        AccountSnapshot snapshot = accountSnapshot();
+        if (!snapshot.valid) return false;
+        float start = snapshot.lastRowCenterY > 0
+                ? Math.max(screenH * .27f, Math.min(screenH * .52f, snapshot.lastRowCenterY))
+                : screenH * .34f;
+        float end = Math.min(screenH * .79f, start + screenH * .34f);
+        if (end - start < screenH * .16f) return false;
+        return swipe(screenW * .45f, start, screenW * .45f, end);
     }
+
+    /** 只允许从可见账号行向上滑，避免在底部「缓存/设置」菜单区域空滑。 */
+    private boolean swipeAccountListTowardBottom(AccountSnapshot snapshot) {
+        if (!snapshot.valid || snapshot.lastRowCenterY <= 0) return false;
+        float start = Math.max(screenH * .27f,
+                Math.min(screenH * .66f, snapshot.lastRowCenterY));
+        float end = Math.max(screenH * .12f, start - screenH * .30f);
+        if (start - end < screenH * .16f) return false;
+        return swipe(screenW * .45f, start, screenW * .45f, end);
+    }
+
     private boolean headerIsAccount(String label) {
-        // 只有可见的 @username + 上方姓名构成个人资料头，绝不把列表首项当作当前账号。
+        // 必须是个人资料的【大号标题】，不能把页面滑动后的普通账号行当作顶部标题。
         String header = profileHeaderLabel();
         return header != null && header.equals(label);
     }
-    private void chooseAccount(int step, int phase, boolean dryRun) {
+
+    /**
+     * phase=0 回到顶部，phase=1 从顶部向下逐屏寻找。
+     * 同一画面连续出现两次即说明已经到边界，立即改方向或结束；不无限滑动。
+     * 每一次滑动前都先查找目标，能看到目标时立即停止滚动。
+     */
+    private void chooseAccount(int step, int phase, boolean dryRun,
+                               String priorSignature, int stagnant) {
         if (!isTurritForeground()) { finish(false, "当前不是 Turrit 界面"); return; }
         if (headerIsAccount(targetLabel)) { openBot(dryRun); return; }
         AccountSnapshot snapshot = accountSnapshot();
-        if (!snapshot.valid) { finish(false, "未找到展开的账号列表，已停止切换"); return; }
+        if (!snapshot.valid) { finish(false, "账号列表已关闭或不可读，已停止切换"); return; }
         AccessibilityNodeInfo node = findAccountRow(targetLabel, snapshot.addTop);
         if (node != null) {
             if (!click(node)) { finish(false, "账号无法点击：" + targetLabel); return; }
@@ -371,25 +393,53 @@ public class TurritAccessibilityService extends AccessibilityService {
             });
             return;
         }
-        if (step >= MAX_ACCOUNT_SWIPES) {
-            finish(false, "已停止滑动：账号列表中未找到「" + targetLabel + "」");
+        String signature = snapshot.signature();
+        int unchanged = (step > 0 && signature.equals(priorSignature)) ? stagnant + 1 : 0;
+        if (phase == 0) {
+            // 已到顶、画面不变或回滑达到上限，开始向下查找。
+            if (step >= MAX_SELECT_TOP_SWIPES || unchanged >= 1) {
+                Store.get(this).log("账号查找：已回到顶部，向下查找「" + targetLabel + "」");
+                chooseAccount(0, 1, dryRun, "", 0);
+                return;
+            }
+            if (!swipeAccountListTowardTop()) {
+                chooseAccount(0, 1, dryRun, "", 0);
+                return;
+            }
+            after(600, () -> chooseAccount(step + 1, 0, dryRun, signature, unchanged));
             return;
         }
-        // 如果从上往下未找到，只回拉一次再重新寻找。
-        float bottom = Math.min(screenH * .66f, snapshot.addTop - screenH * .02f);
-        float top = Math.max(screenH * .085f, bottom - screenH * .17f);
-        if (bottom - top < screenH * .06f) {
-            finish(false, "账号列表已到边界，无法继续搜索：" + targetLabel); return;
+        // 到底后不再继续下滑；不点击「设置/缓存/客服」等无关控件。
+        if (step >= MAX_SELECT_DOWN_SWIPES || unchanged >= 1) {
+            finish(false, "已双向查找账号，列表中未找到「" + targetLabel
+                    + "」；请确认 Turrit 中该账号名称未改变");
+            return;
         }
-        swipe(screenW * .43f, bottom, screenW * .43f, top);
-        after(500, () -> chooseAccount(step + 1, phase, dryRun));
+        if (!swipeAccountListTowardBottom(snapshot)) {
+            finish(false, "账号列表已到边界，未找到「" + targetLabel + "」");
+            return;
+        }
+        after(600, () -> chooseAccount(step + 1, 1, dryRun, signature, unchanged));
     }
     private void verifySwitchedAccount(int attempt, boolean dryRun) {
         if (!isTurritForeground()) { finish(false, "切换账号后离开 Turrit"); return; }
         if (headerIsAccount(targetLabel)) { openBot(dryRun); return; }
-        if (attempt >= 2) { finish(false, "无法验证当前账号，已阻止发送：" + targetLabel); return; }
-        swipeAccountListTowardTop();
-        after(520, () -> verifySwitchedAccount(attempt + 1, dryRun));
+        if (attempt >= 3) {
+            finish(false, "切换后无法验证当前账号，已阻止发送：" + targetLabel);
+            return;
+        }
+        // Turrit 往往保留上一个账号「我的」页面的滚动位置。
+        // 即使列表在切换后自动折叠，也要能把【个人资料大标题】拉回屏幕，再验证。
+        boolean moved = swipeAccountListTowardTop();
+        if (!moved && !isProfileTopVisible()) {
+            moved = swipe(screenW * .46f, screenH * .34f,
+                    screenW * .46f, screenH * .76f);
+        }
+        if (!moved) {
+            finish(false, "切换后无法确认顶部账号名称，未发送：" + targetLabel);
+            return;
+        }
+        after(590, () -> verifySwitchedAccount(attempt + 1, dryRun));
     }
 
     private void openBot(boolean dryRun) {
@@ -591,8 +641,11 @@ public class TurritAccessibilityService extends AccessibilityService {
         boolean valid;
         int total = -1;
         int addTop;
+        int lastRowCenterY = -1;
         final Set<String> names = new LinkedHashSet<>();
-        String signature() { return names.toString() + "|" + addTop; }
+        final List<String> visibleRows = new ArrayList<>();
+        // 名称及屏幕位置决定当前是否真的滚动，忽略个人资料标题。
+        String signature() { return visibleRows.toString() + "|" + addTop; }
     }
     private AccessibilityNodeInfo findAddAccountNode() {
         AccessibilityNodeInfo node = findTextRec(getRootInActiveWindow(), "添加账号", .06f, .82f, true);
@@ -641,7 +694,8 @@ public class TurritAccessibilityService extends AccessibilityService {
             String value = nodeText(node).trim();
             if (!validAccountName(value)) continue;
             if (r.left < screenW * .265f || r.centerX() > screenW * .83f
-                    || r.centerY() < screenH * .135f || r.centerY() > screenH * .295f)
+                    || r.centerY() < screenH * .135f || r.centerY() > screenH * .295f
+                    || r.height() < screenH * .031f)
                 continue;
             String cls = safe(node.getClassName());
             if (!cls.contains("TextView") && node.getChildCount() != 0) continue;
@@ -688,7 +742,11 @@ public class TurritAccessibilityService extends AccessibilityService {
             String value = nodeText(node).trim();
             if (r.centerY() <= minY || r.centerY() >= shot.addTop - screenH * .010f) continue;
             if (r.centerX() < screenW * .13f || r.centerX() > screenW * .80f) continue;
-            if (validAccountName(value)) shot.names.add(value);
+            if (validAccountName(value)) {
+                shot.names.add(value);
+                shot.visibleRows.add(value + "@" + Math.round(r.centerY() / 18f));
+                shot.lastRowCenterY = Math.max(shot.lastRowCenterY, r.centerY());
+            }
         }
         return shot;
     }
