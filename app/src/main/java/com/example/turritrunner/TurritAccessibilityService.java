@@ -570,37 +570,91 @@ public class TurritAccessibilityService extends AccessibilityService {
         if (attempt < 6) { after(600, () -> verifyChat(attempt + 1, manualTest)); return; }
         finish(false, "无法验证机器人顶部标题和聊天输入框，或机器人启动后未出现输入框；未发送关键词");
     }
+    /**
+     * Turrit 有些输入框在清空后仍给无障碍返回占位文字，或不给出空值状态。
+     * 不再只因「无法读回空白」就失败：先尝试清草稿，再用 ACTION_SET_TEXT
+     * 整段覆盖新正文，只有重新读到【与待发送内容完全一致】才准点发送。
+     * 如果 Turrit 无法回读真实输入内容，仍然中止，避免混发旧草稿。
+     */
     private void clearDraftAndSend(int index) {
-        AccessibilityNodeInfo edit = editableAtBottom(getRootInActiveWindow());
+        if (!isTurritForeground()) {
+            finish(false, "清空草稿时已离开 Turrit，停止发送"); return;
+        }
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (findTextRec(root, expectedTitle, .035f, .22f, false) == null) {
+            finish(false, "清空草稿前机器人标题校验失败，停止发送"); return;
+        }
+        AccessibilityNodeInfo edit = editableAtBottom(root);
         if (edit == null) { finish(false, "未定位到聊天输入框，停止发送"); return; }
-        if (!setText(edit, "")) { finish(false, "无法清空当前聊天草稿"); return; }
-        after(330, () -> {
-            AccessibilityNodeInfo fresh = editableAtBottom(getRootInActiveWindow());
-            if (fresh == null || !isEmptyField(fresh)) {
-                finish(false, "清空草稿后无法验证为空；已阻止发送"); return;
+        boolean accepted = setText(edit, "");
+        if (!accepted) {
+            // 某些第三方客户端拒绝设置空字符串，却接受写入非空文本。
+            // 允许进入“整段覆盖并精确校验”路径；不进行盲目按键或长按粘贴。
+            Store.get(this).log("Turrit 未接受清空操作，尝试全文覆盖并严格核对，不会直接发送旧草稿");
+        }
+        after(420, () -> {
+            AccessibilityNodeInfo latestRoot = getRootInActiveWindow();
+            if (!isTurritForeground() ||
+                    findTextRec(latestRoot, expectedTitle, .035f, .22f, false) == null) {
+                finish(false, "清空草稿后聊天页面发生变化，停止发送"); return;
+            }
+            AccessibilityNodeInfo fresh = editableAtBottom(latestRoot);
+            if (fresh == null) {
+                finish(false, "清空草稿后找不到输入框，停止发送"); return;
+            }
+            if (!isEmptyField(fresh)) {
+                Store.get(this).log("草稿清空后无障碍未报告空白，改用全文覆盖；发送前必须核对正文完全一致");
             }
             sendMessage(index);
         });
     }
     private void sendMessage(int index) {
-        if (index >= payload.size()) { finish(true, "已发送 " + completedMessages + " 条"); return; }
+        if (index >= payload.size()) {
+            finish(true, "客户端发送动作已完成 " + completedMessages + " 条（不代表服务端确认）");
+            return;
+        }
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (!isTurritForeground() || findTextRec(root, expectedTitle, .035f, .22f, false) == null) {
-            finish(false, "发送前机器人标题校验失败，已发送 " + completedMessages + " 条"); return;
+            finish(false, "发送前机器人标题校验失败，已处理 " + completedMessages + " 条"); return;
         }
         AccessibilityNodeInfo edit = editableAtBottom(root);
-        if (edit == null) { finish(false, "未找到输入框，已发送 " + completedMessages + " 条"); return; }
+        if (edit == null) { finish(false, "未找到输入框，已处理 " + completedMessages + " 条"); return; }
         String content = payload.get(index);
-        if (!setText(edit, content)) { finish(false, "无法填写第 " + (index + 1) + " 条消息"); return; }
-        after(450, () -> {
-            AccessibilityNodeInfo latest = editableAtBottom(getRootInActiveWindow());
-            if (latest == null || !content.equals(readText(latest))) {
-                finish(false, "输入框内容不匹配，禁止点击发送"); return;
-            }
-            if (!pressSend(latest)) { finish(false, "未找到发送按钮"); return; }
-            // 只检查一次发送结果，不自动重发，避免重复发送。
-            after(900, () -> verifySent(index));
-        });
+        if (TextUtils.isEmpty(content) || content.trim().isEmpty()) {
+            finish(false, "本次抽取的文字为空，停止发送"); return;
+        }
+        // ACTION_SET_TEXT 是完整替换而不是追加；不能用粘贴追加的方式处理旧草稿。
+        if (!setText(edit, content)) {
+            finish(false, "Turrit 不支持通过无障碍完整覆盖第 " + (index + 1) + " 条消息，停止发送");
+            return;
+        }
+        after(340, () -> verifyComposedText(index, 0));
+    }
+    /** 只重读，不重复输入、更不重复点击发送；Turrit 节点刷新可能有短延迟。 */
+    private void verifyComposedText(int index, int attempt) {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (!isTurritForeground() || findTextRec(root, expectedTitle, .035f, .22f, false) == null) {
+            finish(false, "核对输入内容时离开目标聊天，停止发送"); return;
+        }
+        AccessibilityNodeInfo latest = editableAtBottom(root);
+        if (latest == null) {
+            finish(false, "填写后无法读取输入框，停止发送"); return;
+        }
+        String expected = payload.get(index);
+        if (!latest.isShowingHintText() && expected.equals(readText(latest))) {
+            if (!pressSend(latest)) { finish(false, "未找到可用的发送按钮"); return; }
+            // 已点击发送一次，不自动重试，避免重复发送。
+            after(950, () -> verifySent(index));
+            return;
+        }
+        if (attempt < 2) {
+            after(280, () -> verifyComposedText(index, attempt + 1));
+            return;
+        }
+        Store.get(this).log("输入框回读不一致：第 " + (index + 1)
+                + " 条，检测长度=" + readText(latest).length()
+                + "，显示占位=" + latest.isShowingHintText());
+        finish(false, "输入框未能回读到完整待发文字；已阻止发送，防止旧草稿混入");
     }
     private void verifySent(int index) {
         AccessibilityNodeInfo root = getRootInActiveWindow();
@@ -609,12 +663,16 @@ public class TurritAccessibilityService extends AccessibilityService {
         }
         AccessibilityNodeInfo edit = editableAtBottom(root);
         if (edit == null) { finish(false, "发送后无法确认输入框状态，请人工检查"); return; }
+        // 特别防止消息正文与通用 placeholder 同名时错误地把未发送当成已清空。
+        if (payload.get(index).equals(readText(edit)) && !edit.isShowingHintText()) {
+            finish(false, "点击发送后输入内容仍保留，不自动重发，请人工检查"); return;
+        }
         if (!isEmptyField(edit)) {
             finish(false, "点击发送后输入框仍有内容，未重试以防重复，请人工检查"); return;
         }
-        // 输入框清空只表明客户端已接受发送动作，不等同于 Telegram 服务端送达。
+        // 只能证明客户端输入框恢复空白，不等同于服务端成功送达。
         completedMessages++;
-        if (index + 1 < payload.size()) after(400, () -> sendMessage(index + 1));
+        if (index + 1 < payload.size()) after(460, () -> sendMessage(index + 1));
         else finish(true, "客户端发送动作已完成 " + completedMessages + " 条（不代表服务端确认）");
     }
 
@@ -665,10 +723,16 @@ public class TurritAccessibilityService extends AccessibilityService {
         return edit.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
     }
     private boolean isEmptyField(AccessibilityNodeInfo edit) {
-        // getText() 对有 hint 的安卓 EditText 可能返回 placeholder；用 getHintText() 分辨。
-        String content = readText(edit);
-        String hint = safe(edit.getHintText());
-        return content.isEmpty() || (edit.isShowingHintText() && (hint.isEmpty() || hint.equals(content)));
+        if (edit == null) return false;
+        String content = readText(edit).trim();
+        if (content.isEmpty()) return true;
+        // Android EditText 可能将提示文本放在 getText() 而不是 getHintText()。
+        if (edit.isShowingHintText()) return true;
+        String hint = safe(edit.getHintText()).trim();
+        if (!hint.isEmpty() && hint.equals(content)) return true;
+        // Turrit 自绘输入框常见占位语，必须整句相同，不能包含匹配。
+        String normalized = content.replace("…", "...").replace("。", "").trim();
+        return normalized.matches("(?i)^(输入消息|输入文字|发送消息|输入关键字|输入关键词|输入关键|message|type a message|write a message)(\\.{0,3})$");
     }
     private AccessibilityNodeInfo findLabel(String text, float minY, float maxY) {
         return findTextRec(getRootInActiveWindow(), text, minY, maxY, false);
