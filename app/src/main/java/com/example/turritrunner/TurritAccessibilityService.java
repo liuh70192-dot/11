@@ -23,6 +23,7 @@ import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.Set;
+import java.util.function.Consumer;
 
 /**
  * MuMu/Turrit 前台无障碍自动化。
@@ -88,10 +89,9 @@ public class TurritAccessibilityService extends AccessibilityService {
             if (!launchTurrit()) { finishDiscover("无法启动 Turrit"); return; }
             after(1100, () -> {
                 if (!goMe()) { finishDiscover("无法打开 Turrit 的「我的」页面"); return; }
-                after(550, () -> {
-                    expandAccounts();
-                    after(500, () -> moveAccountListToTop(0));
-                });
+                after(650, () -> ensureAccountPanelOpen(0,
+                    () -> moveAccountListToTop(0),
+                    this::finishDiscover));
             });
         });
     }
@@ -106,8 +106,8 @@ public class TurritAccessibilityService extends AccessibilityService {
     private void moveAccountListToTop(int attempt) {
         if (cancelled) { finishDiscover("已取消"); return; }
         if (!isTurritForeground()) { finishDiscover("Turrit 不在前台"); return; }
-        if (findAddAccountNode() == null) {
-            finishDiscover("账号列表未展开，请在 Turrit 的「我的」页展开账号列表后重试"); return;
+        if (!accountSnapshot().valid) {
+            finishDiscover("账号区域未能被无障碍识别，已停止扫描（不会继续盲滑）"); return;
         }
         // 向下拉回账号列表顶部，保证当前账户不会因为页面已经滚动而遗漏。
         if (profileHeaderLabel() != null || attempt >= 2) {
@@ -134,7 +134,9 @@ public class TurritAccessibilityService extends AccessibilityService {
             finishDiscover("已读取到 Turrit 显示的 " + expectedAccountCount + " 个账号"); return;
         }
         if (swipes >= MAX_ACCOUNT_SWIPES || noProgressSwipes >= 2) {
-            String detail = expectedAccountCount > discovered.size() ?
+            String detail = discovered.isEmpty() ?
+                "已找到账号区域，但没有可读取的账号文字；请检查 Turrit 无障碍兼容性" :
+                expectedAccountCount > discovered.size() ?
                 "停止滑动：Turrit 显示 " + expectedAccountCount + " 个，当前识别 " + discovered.size() + " 个；请核对" :
                 "扫描结束，已停止自动滑动";
             finishDiscover(detail); return;
@@ -171,10 +173,9 @@ public class TurritAccessibilityService extends AccessibilityService {
             if (!launchTurrit()) { finish(false, "Turrit 未安装或无法启动"); return; }
             after(1100, () -> {
                 if (!goMe()) { finish(false, "无法定位底部「我的」页面"); return; }
-                after(550, () -> {
-                    expandAccounts();
-                    after(450, () -> prepareAccountSelection(0, dryRun));
-                });
+                after(650, () -> ensureAccountPanelOpen(0,
+                    () -> prepareAccountSelection(0, dryRun),
+                    message -> finish(false, message)));
             });
         });
     }
@@ -208,17 +209,52 @@ public class TurritAccessibilityService extends AccessibilityService {
         if (me != null && click(me)) return true;
         return tap(screenW * .91f, screenH * .945f);
     }
-    private void expandAccounts() {
-        // 「添加账号」出现在列表底部时说明列表已展开，避免重复折叠。
-        if (findLabel("添加账号", .25f, .78f) != null) return;
-        AccessibilityNodeInfo arrow = findLabel("展开", .10f, .36f);
-        if (arrow != null && click(arrow)) return;
-        tap(screenW * .915f, screenH * .21f);
+    /**
+     * Turrit 个人页可整体滚动：先回到顶部，再根据「添加账号」/「6/10」检测
+     * 展开状态。不能在尚未确认顶部位置时盲点箭头，否则可能把已展开列表收起。
+     */
+    private void ensureAccountPanelOpen(int returnToTopTries, Runnable ready, Consumer<String> fail) {
+        if (!isTurritForeground()) { fail.accept("Turrit 不在前台"); return; }
+        if (accountSnapshot().valid) { ready.run(); return; }
+        if (returnToTopTries < 2 && !isProfileTopVisible()) {
+            // 从页面中部向下拉，让个人资料头、展开箭头回到屏幕上方。
+            swipe(screenW * .46f, screenH * .36f, screenW * .46f, screenH * .78f);
+            after(620, () -> ensureAccountPanelOpen(returnToTopTries + 1, ready, fail));
+            return;
+        }
+        // 仅点一次箭头，之后必须验证，绝不反复盲点/盲滑。
+        AccessibilityNodeInfo arrow = findLabel("展开", .10f, .38f);
+        boolean triggered = arrow != null && click(arrow);
+        if (!triggered) triggered = tap(screenW * .922f, screenH * .212f);
+        if (!triggered) { fail.accept("无法点击 Turrit 的账号展开按钮"); return; }
+        after(720, () -> {
+            if (!isTurritForeground()) { fail.accept("展开账号后 Turrit 不在前台"); return; }
+            if (accountSnapshot().valid) {
+                ready.run();
+            } else {
+                fail.accept("已尝试自动展开账号，但 Turrit 无障碍节点未返回「添加账号」或账号数量。请确认该页面显示账号列表；如已展开仍报错，说明需要进一步适配此版本的 Turrit 控件。");
+            }
+        });
+    }
+    private boolean isProfileTopVisible() {
+        if (profileHeaderLabel() != null) return true;
+        // 有些版本的用户名位于非叶子节点或 contentDescription 中。
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return false;
+        List<AccessibilityNodeInfo> labels = new ArrayList<>();
+        collectTextLeaves(root, labels);
+        for (AccessibilityNodeInfo node : labels) {
+            Rect r = new Rect(); node.getBoundsInScreen(r);
+            String value = nodeText(node).trim();
+            if (value.matches("@[A-Za-z0-9_]{3,32}") && r.centerY() > screenH * .10f
+                    && r.centerY() < screenH * .35f) return true;
+        }
+        return false;
     }
     private void prepareAccountSelection(int attempt, boolean dryRun) {
         if (!isTurritForeground()) { finish(false, "Turrit 已离开前台"); return; }
-        if (findAddAccountNode() == null) {
-            finish(false, "未找到展开的账号列表，请手动展开一次"); return;
+        if (!accountSnapshot().valid) {
+            finish(false, "无法读取展开后的账号列表（无障碍节点缺失），已停止切换"); return;
         }
         if (profileHeaderLabel() != null || attempt >= 2) {
             chooseAccount(0, 0, dryRun); return;
@@ -430,7 +466,9 @@ public class TurritAccessibilityService extends AccessibilityService {
         String signature() { return names.toString() + "|" + addTop; }
     }
     private AccessibilityNodeInfo findAddAccountNode() {
-        return findTextRec(getRootInActiveWindow(), "添加账号", .06f, .82f, true);
+        AccessibilityNodeInfo node = findTextRec(getRootInActiveWindow(), "添加账号", .06f, .82f, true);
+        if (node == null) node = findTextRec(getRootInActiveWindow(), "Add Account", .06f, .82f, true);
+        return node;
     }
     private String profileHeaderLabel() {
         AccessibilityNodeInfo root = getRootInActiveWindow();
@@ -440,7 +478,7 @@ public class TurritAccessibilityService extends AccessibilityService {
         AccessibilityNodeInfo username = null;
         for (AccessibilityNodeInfo node : leaves) {
             Rect r = new Rect(); node.getBoundsInScreen(r);
-            String value = readText(node).trim();
+            String value = nodeText(node).trim();
             if (value.matches("@[A-Za-z0-9_]{3,32}") && r.centerY() > screenH * .10f
                     && r.centerY() < screenH * .34f && r.centerX() < screenW * .79f) {
                 username = node; break;
@@ -452,7 +490,7 @@ public class TurritAccessibilityService extends AccessibilityService {
         int bestDist = Integer.MAX_VALUE;
         for (AccessibilityNodeInfo node : leaves) {
             Rect r = new Rect(); node.getBoundsInScreen(r);
-            String value = readText(node).trim();
+            String value = nodeText(node).trim();
             int dist = userR.centerY() - r.centerY();
             if (dist > 0 && dist < screenH * .10f && dist < bestDist
                     && r.centerX() > screenW * .18f && r.centerX() < screenW * .75f
@@ -463,30 +501,39 @@ public class TurritAccessibilityService extends AccessibilityService {
     private AccountSnapshot accountSnapshot() {
         AccountSnapshot shot = new AccountSnapshot();
         AccessibilityNodeInfo root = getRootInActiveWindow();
-        AccessibilityNodeInfo add = findAddAccountNode();
-        if (root == null || add == null) return shot;
-        Rect addR = new Rect(); add.getBoundsInScreen(addR);
-        shot.addTop = addR.top;
-        shot.valid = true;
+        if (root == null) return shot;
         List<AccessibilityNodeInfo> leaves = new ArrayList<>();
         collectTextLeaves(root, leaves);
+        AccessibilityNodeInfo add = findAddAccountNode();
+        AccessibilityNodeInfo counterNode = null;
+        for (AccessibilityNodeInfo node : leaves) {
+            Rect r = new Rect(); node.getBoundsInScreen(r);
+            Matcher count = ACCOUNT_COUNTER.matcher(nodeText(node).trim());
+            if (count.matches() && r.centerX() > screenW * .70f
+                    && r.centerY() > screenH * .25f && r.centerY() < screenH * .83f) {
+                shot.total = Math.min(10, Integer.parseInt(count.group(1)));
+                counterNode = node;
+                break;
+            }
+        }
+        if (add == null && counterNode == null) return shot;
+        Rect addR = new Rect();
+        (add != null ? add : counterNode).getBoundsInScreen(addR);
+        shot.addTop = addR.top;
+        shot.valid = true;
         String header = profileHeaderLabel();
         if (header != null) shot.names.add(header);
         int minY = Math.round(screenH * .085f);
         for (AccessibilityNodeInfo node : leaves) {
             Rect r = new Rect(); node.getBoundsInScreen(r);
-            String value = readText(node).trim();
+            String value = nodeText(node).trim();
             if (value.matches("@[A-Za-z0-9_]{3,32}") && r.centerY() < screenH * .34f) {
                 minY = Math.max(minY, r.bottom + Math.round(screenH * .025f));
-            }
-            Matcher count = ACCOUNT_COUNTER.matcher(value);
-            if (count.matches() && r.centerX() > screenW * .70f) {
-                shot.total = Math.min(10, Integer.parseInt(count.group(1)));
             }
         }
         for (AccessibilityNodeInfo node : leaves) {
             Rect r = new Rect(); node.getBoundsInScreen(r);
-            String value = readText(node).trim();
+            String value = nodeText(node).trim();
             if (r.centerY() <= minY || r.centerY() >= shot.addTop - screenH * .010f) continue;
             if (r.centerX() < screenW * .13f || r.centerX() > screenW * .80f) continue;
             if (validAccountName(value)) shot.names.add(value);
@@ -500,12 +547,12 @@ public class TurritAccessibilityService extends AccessibilityService {
         int minY = Math.round(screenH * .085f);
         for (AccessibilityNodeInfo node : leaves) {
             Rect r = new Rect(); node.getBoundsInScreen(r);
-            if (readText(node).trim().matches("@[A-Za-z0-9_]{3,32}") && r.centerY() < screenH * .34f)
+            if (nodeText(node).trim().matches("@[A-Za-z0-9_]{3,32}") && r.centerY() < screenH * .34f)
                 minY = Math.max(minY, r.bottom + Math.round(screenH * .025f));
         }
         for (AccessibilityNodeInfo node : leaves) {
             Rect r = new Rect(); node.getBoundsInScreen(r);
-            if (readText(node).trim().equals(wanted) && r.centerY() > minY
+            if (nodeText(node).trim().equals(wanted) && r.centerY() > minY
                     && r.centerY() < addTop - screenH * .010f
                     && r.centerX() > screenW * .13f && r.centerX() < screenW * .80f) return node;
         }
@@ -513,9 +560,17 @@ public class TurritAccessibilityService extends AccessibilityService {
     }
     private void collectTextLeaves(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> out) {
         if (node == null) return;
-        if (node.isVisibleToUser() && node.getChildCount() == 0 && node.getText() != null)
-            out.add(node);
+        String cls = safe(node.getClassName());
+        // Turrit 有些文本节点自带子控件；不能仅检查 childCount == 0。
+        if (node.isVisibleToUser() && !nodeText(node).trim().isEmpty()
+                && (node.getChildCount() == 0 || cls.contains("TextView"))) out.add(node);
         for (int i = 0; i < node.getChildCount(); i++) collectTextLeaves(node.getChild(i), out);
+    }
+    private static String nodeText(AccessibilityNodeInfo node) {
+        if (node == null) return "";
+        String t = readText(node);
+        if (!t.trim().isEmpty()) return t;
+        return safe(node.getContentDescription());
     }
     private boolean validAccountName(String value) {
         if (value.isEmpty() || value.length() > 40 || value.contains("\n") || value.startsWith("@")) return false;
