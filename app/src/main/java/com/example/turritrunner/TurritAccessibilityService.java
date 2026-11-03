@@ -44,11 +44,12 @@ public class TurritAccessibilityService extends AccessibilityService {
     private DiscoverResult discoverCallback;
     private boolean inDiscovery;
     private int screenW = 1080, screenH = 1920;
-    // 每次扫描最多执行四次手势；账号数由 Turrit 的「6/10」等计数决定。
-    private int expectedAccountCount = -1;
-    private int noProgressSwipes = 0;
-    private String previousScanSignature = "";
-    private static final int MAX_ACCOUNT_SWIPES = 4;
+    // 完整扫描：先把可滚动账号列表拉到顶部，再逐屏向下找账号。
+    // 以前依赖个人资料头像判断到顶，但头像固定可见，导致遗漏列表尾部的账号。
+    private static final int INITIAL_TOP_SWIPES = 3;
+    private static final int MAX_ACCOUNT_SWIPES = 7;
+    private static final int MAX_REVERSE_SWIPES = 3;
+
     private static final Pattern ACCOUNT_COUNTER = Pattern.compile("^(\\d{1,2})\\s*/\\s*10$");
 
 
@@ -99,56 +100,104 @@ public class TurritAccessibilityService extends AccessibilityService {
         if (!busy || !inDiscovery) return;
         busy = false; inDiscovery = false;
         List<String> result = new ArrayList<>(discovered);
+        // 自动持久化在无障碍服务内完成；即使 Activity 在后台甚至被回收，也不会丢失。
+        // 只有明确识别齐「6/10」全部账号，才用新名单替换旧名单。
+        // 数量不足时只增量合并，避免漏扫把已有账号删掉。
+        Store store = Store.get(this);
+        if (!result.isEmpty()) {
+            if (expectedAccountCount > 0 && result.size() == expectedAccountCount) {
+                store.replaceFoundAccounts(result);
+            } else {
+                store.mergeFoundAccounts(result);
+            }
+        }
+        String count = expectedAccountCount > 0 ? result.size() + "/" + expectedAccountCount
+                                                    : result.size() + " 个";
+        String summary = (result.isEmpty() ? "未识别到账号" : "已自动保存 " + count + " 账号")
+                + "；" + detail;
+        store.log("识别账号：" + summary);
         DiscoverResult cb = discoverCallback; discoverCallback = null;
-        Store.get(this).log("识别账号：" + result.size() + " 个；" + detail);
-        if (cb != null) cb.done(result, detail);
+        if (cb != null) cb.done(result, summary);
     }
+
     private void moveAccountListToTop(int attempt) {
         if (cancelled) { finishDiscover("已取消"); return; }
         if (!isTurritForeground()) { finishDiscover("Turrit 不在前台"); return; }
-        if (!accountSnapshot().valid) {
-            finishDiscover("账号区域未能被无障碍识别，已停止扫描（不会继续盲滑）"); return;
+        AccountSnapshot shot = accountSnapshot();
+        if (!shot.valid) {
+            finishDiscover("账号列表已离开屏幕，已停止操作"); return;
         }
-        // 向下拉回账号列表顶部，保证当前账户不会因为页面已经滚动而遗漏。
-        if (profileHeaderLabel() != null || attempt >= 2) {
+        if (shot.total > 0) expectedAccountCount = shot.total;
+        // 有时一打开 Turrit，列表已经停在中间。回拉期间也收集账号，避免遗漏。
+        discovered.addAll(shot.names);
+        if (expectedAccountCount > 0 && discovered.size() >= expectedAccountCount) {
+            finishDiscover("账号数已与 Turrit 显示数量一致"); return;
+        }
+        if (attempt >= INITIAL_TOP_SWIPES) {
+            noProgressSwipes = 0;
+            previousScanSignature = "";
             sweepAccounts(0); return;
         }
-        swipeAccountListTowardTop();
-        after(520, () -> moveAccountListToTop(attempt + 1));
+        if (!swipeAccountListTowardTop()) {
+            sweepAccounts(0); return;
+        }
+        after(590, () -> moveAccountListToTop(attempt + 1));
     }
+
     private void sweepAccounts(int swipes) {
         if (cancelled) { finishDiscover("已取消"); return; }
         if (!isTurritForeground()) { finishDiscover("Turrit 不在前台"); return; }
         AccountSnapshot snapshot = accountSnapshot();
         if (!snapshot.valid) {
-            finishDiscover("未找到「添加账号」边界，已停止扫描，避免识别到设置菜单"); return;
+            finishDiscover("账号区域不可读取，已停止扫描"); return;
         }
         if (snapshot.total > 0) expectedAccountCount = snapshot.total;
-        int previous = discovered.size();
+        int before = discovered.size();
         discovered.addAll(snapshot.names);
         String signature = snapshot.signature();
-        if (previous == discovered.size() || signature.equals(previousScanSignature)) noProgressSwipes++;
+        if (before == discovered.size() && signature.equals(previousScanSignature)) noProgressSwipes++;
         else noProgressSwipes = 0;
         previousScanSignature = signature;
+
         if (expectedAccountCount > 0 && discovered.size() >= expectedAccountCount) {
-            finishDiscover("已读取到 Turrit 显示的 " + expectedAccountCount + " 个账号"); return;
+            finishDiscover("账号数量已核对完成"); return;
         }
-        if (swipes >= MAX_ACCOUNT_SWIPES || noProgressSwipes >= 2) {
-            String detail = discovered.isEmpty() ?
-                "已找到账号区域，但没有可读取的账号文字；请检查 Turrit 无障碍兼容性" :
-                expectedAccountCount > discovered.size() ?
-                "停止滑动：Turrit 显示 " + expectedAccountCount + " 个，当前识别 " + discovered.size() + " 个；请核对" :
-                "扫描结束，已停止自动滑动";
-            finishDiscover(detail); return;
+        // 最多前进 7 次；若仍未齐，回退有限次数补扫，而不是无限向下滑。
+        if (swipes >= MAX_ACCOUNT_SWIPES || (swipes >= 4 && noProgressSwipes >= 3)) {
+            sweepAccountsReverse(0); return;
         }
-        // 只在账号列表区域滑动，不再连续十几次滑过整个设置页。
-        float bottom = Math.min(screenH * .66f, snapshot.addTop - screenH * .02f);
-        float top = Math.max(screenH * .085f, bottom - screenH * .17f);
-        if (bottom - top < screenH * .06f) {
-            finishDiscover("账号列表已到边界，停止滑动"); return;
+        float bottom = Math.min(screenH * .67f, snapshot.addTop - screenH * .045f);
+        float top = Math.max(screenH * .30f, bottom - screenH * .23f);
+        if (bottom - top < screenH * .09f) {
+            sweepAccountsReverse(0); return;
         }
-        swipe(screenW * .43f, bottom, screenW * .43f, top);
-        after(530, () -> sweepAccounts(swipes + 1));
+        if (!swipe(screenW * .44f, bottom, screenW * .44f, top)) {
+            sweepAccountsReverse(0); return;
+        }
+        after(600, () -> sweepAccounts(swipes + 1));
+    }
+
+    private void sweepAccountsReverse(int reverseSwipes) {
+        if (cancelled) { finishDiscover("已取消"); return; }
+        if (!isTurritForeground()) { finishDiscover("Turrit 不在前台"); return; }
+        AccountSnapshot snapshot = accountSnapshot();
+        if (!snapshot.valid) { finishDiscover("扫描结束，列表不可读取"); return; }
+        if (snapshot.total > 0) expectedAccountCount = snapshot.total;
+        discovered.addAll(snapshot.names);
+        if (expectedAccountCount > 0 && discovered.size() >= expectedAccountCount) {
+            finishDiscover("账号数量已核对完成"); return;
+        }
+        if (reverseSwipes >= MAX_REVERSE_SWIPES) {
+            finishDiscover(expectedAccountCount > discovered.size()
+                    ? "Turrit 显示 " + expectedAccountCount + " 个，当前只读取到 " + discovered.size()
+                            + " 个；已保存已识别账号，未清除旧账号"
+                    : "有限次数双向扫描已结束");
+            return;
+        }
+        if (!swipeAccountListTowardTop()) {
+            finishDiscover("列表已停止滚动，已保留本次识别结果"); return;
+        }
+        after(600, () -> sweepAccountsReverse(reverseSwipes + 1));
     }
 
     /** 实际发送仅在页面识别成功后继续；单账号「立即测试」为不发送的安全检查。 */
@@ -262,16 +311,18 @@ public class TurritAccessibilityService extends AccessibilityService {
         swipeAccountListTowardTop();
         after(520, () -> prepareAccountSelection(attempt + 1, dryRun));
     }
-    private void swipeAccountListTowardTop() {
+    private boolean swipeAccountListTowardTop() {
         AccessibilityNodeInfo add = findAddAccountNode();
-        int y = Math.round(screenH * .64f);
+        int addTop = Math.round(screenH * .69f);
         if (add != null) {
             Rect b = new Rect(); add.getBoundsInScreen(b);
-            y = b.top - Math.round(screenH * .02f);
+            addTop = b.top;
         }
-        float from = Math.max(screenH * .095f, Math.min(screenH * .43f, y - screenH * .16f));
-        float to = Math.min(screenH * .70f, from + screenH * .17f);
-        swipe(screenW * .43f, from, screenW * .43f, to);
+        // 只在「头像下方 ~ 添加账号上方」的账号列表内部滑动。
+        float to = Math.min(screenH * .69f, addTop - screenH * .04f);
+        float from = Math.max(screenH * .31f, to - screenH * .23f);
+        if (to - from < screenH * .09f) return false;
+        return swipe(screenW * .44f, from, screenW * .44f, to);
     }
     private boolean headerIsAccount(String label) {
         // 只有可见的 @username + 上方姓名构成个人资料头，绝不把列表首项当作当前账号。

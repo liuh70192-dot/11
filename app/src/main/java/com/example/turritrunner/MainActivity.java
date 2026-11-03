@@ -50,7 +50,6 @@ public class MainActivity extends Activity {
     private Spinner countMode;
     private int page = 0;
     private boolean visible;
-    private List<String> pendingDetectedAccounts;
     private String pendingDetectedDetail;
     private final Runnable heartbeat = new Runnable() {
         @Override public void run() {
@@ -299,40 +298,19 @@ public class MainActivity extends Activity {
     private void detectAccounts() {
         TurritAccessibilityService s = TurritAccessibilityService.current();
         if (s == null) { toast("请先开启无障碍服务"); return; }
-        toast("正在识别账号");
+        toast("正在扫描，完成后自动保存");
         s.discover((names, detail) -> runOnUiThread(() -> {
-            // 扫描时 APK 在后台，先暂存结果；用户返回 APK 再显示核对框。
-            pendingDetectedAccounts = new ArrayList<>(names);
+            // 保存已经由无障碍服务完成；前台只展示结果，不需要再点「保存」。
             pendingDetectedDetail = detail;
             if (visible) showPendingDetectedAccounts();
         }));
     }
     private void showPendingDetectedAccounts() {
-        if (!visible || pendingDetectedAccounts == null) return;
-        List<String> names = pendingDetectedAccounts;
+        if (!visible || pendingDetectedDetail == null) return;
         String detail = pendingDetectedDetail;
-        pendingDetectedAccounts = null;
         pendingDetectedDetail = null;
-        if (names.isEmpty()) {
-            store.log("识别未成功：" + detail);
-            new AlertDialog.Builder(this).setTitle("未识别到账号")
-                .setMessage(detail).setPositiveButton("知道了", null).show();
-            return;
-        }
-        String[] labels = names.toArray(new String[0]);
-        boolean[] selected = new boolean[labels.length];
-        java.util.Arrays.fill(selected, true);
-        new AlertDialog.Builder(this).setTitle("核对账号（" + labels.length + "）")
-            .setMessage(detail + "\n取消勾选错误账号后再保存。")
-            .setMultiChoiceItems(labels, selected, (dialog, index, checked) -> selected[index] = checked)
-            .setNegativeButton("取消", null)
-            .setPositiveButton("保存账号", (dialog, which) -> {
-                List<String> approved = new ArrayList<>();
-                for (int i = 0; i < labels.length; i++) if (selected[i]) approved.add(labels[i]);
-                store.replaceFoundAccounts(approved);
-                store.log("已核对并保存 " + approved.size() + " 个账号");
-                render();
-            }).show();
+        render();
+        toast(detail);
     }
     private void manualAccount() {
         EditText name = input("输入 Turrit 账号列表显示的准确名称", "", InputType.TYPE_CLASS_TEXT);
