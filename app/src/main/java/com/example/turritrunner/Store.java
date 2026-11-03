@@ -79,6 +79,22 @@ public final class Store {
         putArray("shuffle", new JSONArray());
         return arr.length();
     }
+    /** 在共用消息池中手工新增一条搜索关键词，不覆盖已有的 TXT 内容。 */
+    public synchronized boolean addKeyword(String raw) {
+        if (raw == null) return false;
+        String keyword = raw.replace("\uFEFF", "").trim();
+        if (keyword.isEmpty() || keyword.length() > 4096 || keyword.contains("\n")
+                || keyword.contains("\r")) return false;
+        List<String> current = messages();
+        if (current.size() >= 20000 || current.contains(keyword)) return false;
+        JSONArray arr = array("messages");
+        arr.put(keyword);
+        putArray("messages", arr);
+        // 池发生变化，重建下一轮随机顺序，避免新增关键词长期不被抽到。
+        putArray("shuffle", new JSONArray());
+        return true;
+    }
+
     public synchronized String nextMessage() {
         List<String> pool = messages();
         if (pool.isEmpty()) return null;

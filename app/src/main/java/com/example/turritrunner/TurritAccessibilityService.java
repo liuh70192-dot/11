@@ -46,6 +46,7 @@ public class TurritAccessibilityService extends AccessibilityService {
     private final Set<String> discovered = new LinkedHashSet<>();
     private DiscoverResult discoverCallback;
     private boolean inDiscovery;
+    private boolean returnAfterManualTest;
     private int screenW = 1080, screenH = 1920;
     // 账号扫描任务的状态（v0.4 曾漏掉这三个字段，造成 Java 编译失败）。
     private int expectedAccountCount = -1;
@@ -125,6 +126,9 @@ public class TurritAccessibilityService extends AccessibilityService {
         store.log("识别账号：" + summary);
         DiscoverResult cb = discoverCallback; discoverCallback = null;
         if (cb != null) cb.done(result, summary);
+        // 识别在 Turrit 里完成后，直接回到 APK 的「账号」页。
+        // 之前只回调后台 Activity，Turrit 始终位于前台，用户看不到保存结果。
+        if (!cancelled) returnToAssistant(1);
     }
 
     private void moveAccountListToTop(int attempt) {
@@ -219,6 +223,7 @@ public class TurritAccessibilityService extends AccessibilityService {
                 cb.done(false, "消息库为空"); return;
             }
             this.busy = true; this.cancelled = false; this.inDiscovery = false;
+            this.returnAfterManualTest = dryRun;
             this.callback = cb; this.targetLabel = label.trim();
             this.botUser = bot.replace("@", "").trim(); this.expectedTitle = title.trim();
             this.payload = texts == null ? Collections.emptyList() : texts;
@@ -239,8 +244,24 @@ public class TurritAccessibilityService extends AccessibilityService {
         if (!busy || inDiscovery) return;
         busy = false;
         Result cb = callback; callback = null;
+        boolean goBack = returnAfterManualTest;
+        returnAfterManualTest = false;
         Store.get(this).log((ok ? "成功" : "失败") + "：" + targetLabel + " / " + reason);
         if (cb != null) cb.done(ok, reason);
+        // 手动「测试」是前台交互，测试结束要回到 APK；定时任务不强制回到 APK。
+        if (goBack && !cancelled) returnToAssistant(1);
+    }
+    private void returnToAssistant(int tab) {
+        h.postDelayed(() -> {
+            Intent intent = new Intent(this, MainActivity.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            intent.putExtra(MainActivity.EXTRA_RETURN_TAB, tab);
+            try { startActivity(intent); }
+            catch (Exception e) {
+                Store.get(this).log("完成后返回 APK 失败：" + e.getClass().getSimpleName());
+            }
+        }, 180);
     }
     private void after(long ms, Runnable r) {
         h.postDelayed(() -> { if (busy && !cancelled) r.run(); }, ms);
@@ -578,6 +599,11 @@ public class TurritAccessibilityService extends AccessibilityService {
         if (node == null) node = findTextRec(getRootInActiveWindow(), "Add Account", .06f, .82f, true);
         return node;
     }
+    /**
+     * 获取个人资料顶部的当前账号名称。
+     * Turrit 的无 username 账号（例如「1」）只显示头像和名称，不显示 @xxx。
+     * 旧版只支持有 @username 的个人资料头，因此在账号切换成功后会误报验证失败。
+     */
     private String profileHeaderLabel() {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return null;
@@ -592,19 +618,37 @@ public class TurritAccessibilityService extends AccessibilityService {
                 username = node; break;
             }
         }
-        if (username == null) return null;
-        Rect userR = new Rect(); username.getBoundsInScreen(userR);
-        String selected = null;
-        int bestDist = Integer.MAX_VALUE;
+        if (username != null) {
+            Rect userR = new Rect(); username.getBoundsInScreen(userR);
+            String selected = null;
+            int bestDist = Integer.MAX_VALUE;
+            for (AccessibilityNodeInfo node : leaves) {
+                Rect r = new Rect(); node.getBoundsInScreen(r);
+                String value = nodeText(node).trim();
+                int dist = userR.centerY() - r.centerY();
+                if (dist > 0 && dist < screenH * .10f && dist < bestDist
+                        && r.centerX() > screenW * .18f && r.centerX() < screenW * .75f
+                        && validAccountName(value)) { selected = value; bestDist = dist; }
+            }
+            if (selected != null) return selected;
+        }
+        // 没有 @username 的账户：仅从固定的「头像右边个人资料标题」区域读取。
+        // 不能匹配下方账号列表，避免把列表中的其他账号误判为当前账号。
+        String name = null;
+        float best = -Float.MAX_VALUE;
         for (AccessibilityNodeInfo node : leaves) {
             Rect r = new Rect(); node.getBoundsInScreen(r);
             String value = nodeText(node).trim();
-            int dist = userR.centerY() - r.centerY();
-            if (dist > 0 && dist < screenH * .10f && dist < bestDist
-                    && r.centerX() > screenW * .18f && r.centerX() < screenW * .75f
-                    && validAccountName(value)) { selected = value; bestDist = dist; }
+            if (!validAccountName(value)) continue;
+            if (r.left < screenW * .265f || r.centerX() > screenW * .83f
+                    || r.centerY() < screenH * .135f || r.centerY() > screenH * .295f)
+                continue;
+            String cls = safe(node.getClassName());
+            if (!cls.contains("TextView") && node.getChildCount() != 0) continue;
+            float score = r.height() * 4f - Math.abs(r.centerY() - screenH * .20f);
+            if (score > best) { best = score; name = value; }
         }
-        return selected;
+        return name;
     }
     private AccountSnapshot accountSnapshot() {
         AccountSnapshot shot = new AccountSnapshot();

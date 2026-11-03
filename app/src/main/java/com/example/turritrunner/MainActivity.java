@@ -34,6 +34,7 @@ import java.util.List;
 
 /** 不依赖第三方 UI SDK，适配 MuMu 1080×1920（约360×640dp）纵屏。 */
 public class MainActivity extends Activity {
+    public static final String EXTRA_RETURN_TAB = "com.example.turritrunner.EXTRA_RETURN_TAB";
     private static final int SELECT_TXT = 801;
     private static final int NAVY = Color.rgb(18, 37, 67);
     private static final int BLUE = Color.rgb(46, 110, 232);
@@ -62,11 +63,25 @@ public class MainActivity extends Activity {
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
         store = Store.get(this);
+        applyReturnTab(getIntent());
         if (store.isRunning() && !SchedulerService.alive) {
             store.setRunning(false);
             store.interruptJobs();
         }
         buildShell();
+    }
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        applyReturnTab(intent);
+        if (visible) { render(); h.post(this::showPendingDetectedAccounts); }
+    }
+    private void applyReturnTab(Intent intent) {
+        if (intent != null && intent.hasExtra(EXTRA_RETURN_TAB)) {
+            int tab = intent.getIntExtra(EXTRA_RETURN_TAB, -1);
+            if (tab >= 0 && tab <= 4) page = tab;
+            intent.removeExtra(EXTRA_RETURN_TAB);
+        }
     }
     @Override protected void onResume() {
         super.onResume(); visible = true;
@@ -108,7 +123,7 @@ public class MainActivity extends Activity {
     private Button button(String label, int color) {
         Button b = new Button(this);
         b.setAllCaps(false); b.setText(label); b.setTextSize(12.5f);
-        b.setTextColor(color == Color.WHITE ? NAVY : Color.WHITE);
+        b.setTextColor(color == BLUE ? Color.WHITE : NAVY);
         b.setBackground(bg(color, 11, 0));
         b.setPadding(dp(7), 0, dp(7), 0);
         b.setMinHeight(0); b.setMinimumHeight(0);
@@ -362,6 +377,26 @@ public class MainActivity extends Activity {
     }
     private void messagePage() {
         LinearLayout card = card("共用文字消息库");
+        // 直接输入一个搜索关键词，就能加入共用消息池；不必每次做 TXT 文件。
+        LinearLayout keywordRow = row();
+        EditText keyword = input("输入关键词，例如：新闻", "", InputType.TYPE_CLASS_TEXT);
+        keywordRow.addView(keyword, new LinearLayout.LayoutParams(0, dp(43), 1f));
+        Button addKeyword = primary("添加");
+        LinearLayout.LayoutParams addParam = new LinearLayout.LayoutParams(dp(62), dp(43));
+        addParam.setMargins(dp(8), 0, 0, 0);
+        keywordRow.addView(addKeyword, addParam);
+        add(card, keywordRow, -1, -2);
+        gap(card, 12);
+        addKeyword.setOnClickListener(v -> {
+            String value = keyword.getText().toString().trim();
+            if (value.isEmpty()) { toast("请先输入关键词"); return; }
+            if (!store.addKeyword(value)) {
+                toast("关键词重复、过长或消息库已满，未添加"); return;
+            }
+            store.log("手工添加关键词到消息池");
+            toast("已加入共用消息库");
+            render();
+        });
         LinearLayout buttons = row();
         Button choose = primary("导入 TXT 文件"); Button clear = neutral("清空消息库");
         weighted(buttons, choose); weighted(buttons, clear);
