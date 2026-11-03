@@ -44,6 +44,10 @@ public class TurritAccessibilityService extends AccessibilityService {
     private DiscoverResult discoverCallback;
     private boolean inDiscovery;
     private int screenW = 1080, screenH = 1920;
+    // 账号扫描任务的状态（v0.4 曾漏掉这三个字段，造成 Java 编译失败）。
+    private int expectedAccountCount = -1;
+    private int noProgressSwipes = 0;
+    private String previousScanSignature = "";
     // 完整扫描：先把可滚动账号列表拉到顶部，再逐屏向下找账号。
     // 以前依赖个人资料头像判断到顶，但头像固定可见，导致遗漏列表尾部的账号。
     private static final int INITIAL_TOP_SWIPES = 3;
