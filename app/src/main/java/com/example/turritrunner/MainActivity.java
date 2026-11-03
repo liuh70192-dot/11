@@ -257,7 +257,7 @@ public class MainActivity extends Activity {
         for (Store.Account a : store.accounts()) if (a.enabled) enabled++;
         if (enabled == 0) { toast("先到「账号」识别并启用账号"); page = 1; render(); return; }
         new AlertDialog.Builder(this).setTitle("开始执行随机任务？")
-            .setMessage("将对 " + enabled + " 个账号安排未来 24 小时的任务，开始后会自动切换 Turrit 并发送文字。\n\n请先用账号「立即测试（不发送）」验证页面识别。")
+            .setMessage("将对 " + enabled + " 个账号安排未来 24 小时的任务，开始后会自动切换 Turrit 并发送文字。\n\n请先用账号「测试发送」进行单账号测试（会实际发送消息池中的 1 条文字）。")
             .setNegativeButton("取消", null)
             .setPositiveButton("开始", (d, w) -> {
                 try {
@@ -303,8 +303,8 @@ public class MainActivity extends Activity {
             add(one, enabled, 38, 42);
             TextView name = text(a.display(), 13, NAVY, true);
             one.addView(name, new LinearLayout.LayoutParams(0, dp(43), 1f));
-            Button edit = neutral("编辑"); Button test = primary("测试");
-            add(one, edit, 48, 36); add(one, test, 48, 36);
+            Button edit = neutral("编辑"); Button test = primary("测试发送");
+            add(one, edit, 46, 36); add(one, test, 68, 36);
             edit.setOnClickListener(v -> editAccount(a));
             test.setOnClickListener(v -> testAccount(a));
             add(list, one, -1, -2); gap(list, 5);
@@ -371,9 +371,14 @@ public class MainActivity extends Activity {
         if (TextUtils.isEmpty(store.bot()) || TextUtils.isEmpty(store.expectedTitle())) {
             toast("请先在任务页保存机器人用户名和顶部名称关键词"); return;
         }
-        toast("开始检查账号 " + a.label + "（不发送）");
-        s.run(a.label, store.bot(), store.expectedTitle(), new ArrayList<>(), true,
-            (ok, info) -> runOnUiThread(() -> toast((ok ? "测试通过：" : "测试未通过：") + info)));
+        // 手动测试也发送，固定只取消息库中的 1 条，不使用每日任务次数。
+        String testText = store.nextMessage();
+        if (TextUtils.isEmpty(testText)) { toast("消息池为空，先在消息库添加测试关键词"); return; }
+        List<String> oneMessage = new ArrayList<>();
+        oneMessage.add(testText);
+        toast("测试账号 " + a.label + "：将向机器人发送 1 条文字");
+        s.run(a.label, store.bot(), store.expectedTitle(), oneMessage, true,
+            (ok, info) -> runOnUiThread(() -> toast((ok ? "测试发送完成：" : "测试未通过：") + info)));
     }
     private void messagePage() {
         LinearLayout card = card("共用文字消息库");

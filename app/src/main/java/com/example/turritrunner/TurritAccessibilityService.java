@@ -47,6 +47,7 @@ public class TurritAccessibilityService extends AccessibilityService {
     private DiscoverResult discoverCallback;
     private boolean inDiscovery;
     private boolean returnAfterManualTest;
+    private boolean botStartTapped;
     private int screenW = 1080, screenH = 1920;
     // 账号扫描任务的状态（v0.4 曾漏掉这三个字段，造成 Java 编译失败）。
     private int expectedAccountCount = -1;
@@ -99,12 +100,9 @@ public class TurritAccessibilityService extends AccessibilityService {
             discoverCallback = cb; discovered.clear(); expectedAccountCount = -1;
             noProgressSwipes = 0; previousScanSignature = "";
             if (!launchTurrit()) { finishDiscover("无法启动 Turrit"); return; }
-            after(1100, () -> {
-                if (!goMe()) { finishDiscover("无法打开 Turrit 的「我的」页面"); return; }
-                after(650, () -> ensureAccountPanelOpen(0,
-                    () -> moveAccountListToTop(0),
+            after(1100, () -> navigateToMe(0,
+                    () -> ensureAccountPanelOpen(0, () -> moveAccountListToTop(0), this::finishDiscover),
                     this::finishDiscover));
-            });
         });
     }
     private void finishDiscover(String detail) {
@@ -214,33 +212,33 @@ public class TurritAccessibilityService extends AccessibilityService {
         after(600, () -> sweepAccountsReverse(reverseSwipes + 1));
     }
 
-    /** 实际发送仅在页面识别成功后继续；单账号「立即测试」为不发送的安全检查。 */
+    /** 每次操作先回到 Turrit 主导航；单账号「测试」也实际发送消息池的 1 条文字。 */
     public void run(String label, String bot, String title, List<String> texts,
-                    boolean dryRun, Result cb) {
+                    boolean manualTest, Result cb) {
         h.post(() -> {
             if (busy) { cb.done(false, "当前有其他任务在执行"); return; }
             if (TextUtils.isEmpty(label) || TextUtils.isEmpty(bot) || TextUtils.isEmpty(title)) {
                 cb.done(false, "缺少账号、机器人用户名或机器人顶部名称关键词"); return;
             }
-            if (!dryRun && (texts == null || texts.isEmpty())) {
+            if (texts == null || texts.isEmpty()) {
                 cb.done(false, "消息库为空"); return;
             }
             this.busy = true; this.cancelled = false; this.inDiscovery = false;
-            this.returnAfterManualTest = dryRun;
+            this.returnAfterManualTest = manualTest;
             this.callback = cb; this.targetLabel = label.trim();
             this.botUser = bot.replace("@", "").trim(); this.expectedTitle = title.trim();
             this.payload = texts == null ? Collections.emptyList() : texts;
             this.completedMessages = 0;
+            this.botStartTapped = false;
             if (!botUser.matches("[A-Za-z0-9_]{5,32}")) {
                 finish(false, "机器人用户名格式不正确"); return;
             }
             if (!launchTurrit()) { finish(false, "Turrit 未安装或无法启动"); return; }
-            after(1100, () -> {
-                if (!goMe()) { finish(false, "无法定位底部「我的」页面"); return; }
-                after(650, () -> ensureAccountPanelOpen(0,
-                    () -> prepareAccountSelection(0, dryRun),
+            after(1100, () -> navigateToMe(0,
+                    () -> ensureAccountPanelOpen(0,
+                            () -> prepareAccountSelection(0, manualTest),
+                            message -> finish(false, message)),
                     message -> finish(false, message)));
-            });
         });
     }
     private void finish(boolean ok, String reason) {
@@ -251,7 +249,7 @@ public class TurritAccessibilityService extends AccessibilityService {
         returnAfterManualTest = false;
         Store.get(this).log((ok ? "成功" : "失败") + "：" + targetLabel + " / " + reason);
         if (cb != null) cb.done(ok, reason);
-        // 手动「测试」是前台交互，测试结束要回到 APK；定时任务不强制回到 APK。
+        // 手动测试发送 1 条，结束后返回 APK；定时任务不强制切回界面。
         if (goBack && !cancelled) returnToAssistant(1);
     }
     private void returnToAssistant(int tab) {
@@ -282,12 +280,52 @@ public class TurritAccessibilityService extends AccessibilityService {
         return root != null && root.getPackageName() != null &&
             Store.TURRIT_PKG.contentEquals(root.getPackageName());
     }
+    /** 只认同时存在的底部导航项，不能在机器人聊天页盲点右下角。 */
+    private boolean hasMainTabBar() {
+        AccessibilityNodeInfo me = findTextRec(getRootInActiveWindow(), "我的", .85f, 1f, true);
+        if (me == null) me = findTextRec(getRootInActiveWindow(), "Me", .85f, 1f, true);
+        AccessibilityNodeInfo chats = findTextRec(getRootInActiveWindow(), "聊天", .85f, 1f, true);
+        if (chats == null) chats = findTextRec(getRootInActiveWindow(), "Chats", .85f, 1f, true);
+        if (me == null || chats == null) return false;
+        Rect m = new Rect(), c = new Rect();
+        me.getBoundsInScreen(m); chats.getBoundsInScreen(c);
+        return m.centerX() > screenW * .72f && c.centerX() < screenW * .28f;
+    }
     private boolean goMe() {
-        if (!isTurritForeground()) return false;
-        AccessibilityNodeInfo me = findLabel("我的", .79f, 1f);
-        if (me == null) me = findLabel("Me", .79f, 1f);
-        if (me != null && click(me)) return true;
-        return tap(screenW * .91f, screenH * .945f);
+        if (!isTurritForeground() || !hasMainTabBar()) return false;
+        AccessibilityNodeInfo me = findTextRec(getRootInActiveWindow(), "我的", .85f, 1f, true);
+        if (me == null) me = findTextRec(getRootInActiveWindow(), "Me", .85f, 1f, true);
+        return me != null && click(me);
+    }
+    /**
+     * 不论目前在聊天、机器人初始页面、个人资料或用户名弹窗，都先有限次数返回主导航。
+     * 绝不能在不认识的页面按固定坐标点击「我的」，可能点到机器人按钮或资料选项。
+     */
+    private void navigateToMe(int backs, Runnable ready, Consumer<String> fail) {
+        if (cancelled) { fail.accept("操作已取消"); return; }
+        if (!isTurritForeground()) {
+            if (backs < 2 && launchTurrit()) {
+                after(650, () -> navigateToMe(backs + 1, ready, fail));
+            } else fail.accept("无法回到 Turrit 主界面");
+            return;
+        }
+        if (hasMainTabBar()) {
+            if (!goMe()) { fail.accept("无法点击 Turrit 底部「我的」选项"); return; }
+            after(650, () -> {
+                if (!isTurritForeground() || !hasMainTabBar()) {
+                    fail.accept("进入「我的」时页面发生变化"); return;
+                }
+                ready.run();
+            });
+            return;
+        }
+        if (backs >= 7) {
+            fail.accept("连续返回后仍没有找到 Turrit 底部导航，停止操作"); return;
+        }
+        if (!performGlobalAction(GLOBAL_ACTION_BACK)) {
+            fail.accept("无法关闭当前页面或弹窗"); return;
+        }
+        after(550, () -> navigateToMe(backs + 1, ready, fail));
     }
     /**
      * Turrit 个人页可整体滚动：先回到顶部，再根据「添加账号」/「6/10」检测
@@ -331,14 +369,14 @@ public class TurritAccessibilityService extends AccessibilityService {
         }
         return false;
     }
-    private void prepareAccountSelection(int attempt, boolean dryRun) {
+    private void prepareAccountSelection(int attempt, boolean manualTest) {
         if (!isTurritForeground()) { finish(false, "Turrit 已离开前台"); return; }
         if (!accountSnapshot().valid) {
             finish(false, "无法读取展开后的账号列表，已停止切换"); return;
         }
         // 与识别账号不同，切换不能只从当前位置向下滚动。
         // 用户可能上次停在底部（只看见「于你执念」和「添加账号」），目标在上面。
-        chooseAccount(0, 0, dryRun, "", 0);
+        chooseAccount(0, 0, manualTest, "", 0);
     }
 
     /**
@@ -378,19 +416,18 @@ public class TurritAccessibilityService extends AccessibilityService {
      * 同一画面连续出现两次即说明已经到边界，立即改方向或结束；不无限滑动。
      * 每一次滑动前都先查找目标，能看到目标时立即停止滚动。
      */
-    private void chooseAccount(int step, int phase, boolean dryRun,
+    private void chooseAccount(int step, int phase, boolean manualTest,
                                String priorSignature, int stagnant) {
         if (!isTurritForeground()) { finish(false, "当前不是 Turrit 界面"); return; }
-        if (headerIsAccount(targetLabel)) { openBot(dryRun); return; }
+        if (headerIsAccount(targetLabel)) { openBot(manualTest); return; }
         AccountSnapshot snapshot = accountSnapshot();
         if (!snapshot.valid) { finish(false, "账号列表已关闭或不可读，已停止切换"); return; }
         AccessibilityNodeInfo node = findAccountRow(targetLabel, snapshot.addTop);
         if (node != null) {
             if (!click(node)) { finish(false, "账号无法点击：" + targetLabel); return; }
-            after(900, () -> {
-                if (!goMe()) { finish(false, "切换后无法打开个人资料页"); return; }
-                after(550, () -> verifySwitchedAccount(0, dryRun));
-            });
+            after(850, () -> navigateToMe(0,
+                    () -> verifySwitchedAccount(0, manualTest),
+                    message -> finish(false, "切换账号后返回「我的」失败：" + message)));
             return;
         }
         String signature = snapshot.signature();
@@ -399,14 +436,14 @@ public class TurritAccessibilityService extends AccessibilityService {
             // 已到顶、画面不变或回滑达到上限，开始向下查找。
             if (step >= MAX_SELECT_TOP_SWIPES || unchanged >= 1) {
                 Store.get(this).log("账号查找：已回到顶部，向下查找「" + targetLabel + "」");
-                chooseAccount(0, 1, dryRun, "", 0);
+                chooseAccount(0, 1, manualTest, "", 0);
                 return;
             }
             if (!swipeAccountListTowardTop()) {
-                chooseAccount(0, 1, dryRun, "", 0);
+                chooseAccount(0, 1, manualTest, "", 0);
                 return;
             }
-            after(600, () -> chooseAccount(step + 1, 0, dryRun, signature, unchanged));
+            after(600, () -> chooseAccount(step + 1, 0, manualTest, signature, unchanged));
             return;
         }
         // 到底后不再继续下滑；不点击「设置/缓存/客服」等无关控件。
@@ -419,11 +456,16 @@ public class TurritAccessibilityService extends AccessibilityService {
             finish(false, "账号列表已到边界，未找到「" + targetLabel + "」");
             return;
         }
-        after(600, () -> chooseAccount(step + 1, 1, dryRun, signature, unchanged));
+        after(600, () -> chooseAccount(step + 1, 1, manualTest, signature, unchanged));
     }
-    private void verifySwitchedAccount(int attempt, boolean dryRun) {
+    private void verifySwitchedAccount(int attempt, boolean manualTest) {
         if (!isTurritForeground()) { finish(false, "切换账号后离开 Turrit"); return; }
-        if (headerIsAccount(targetLabel)) { openBot(dryRun); return; }
+        if (hasMainTabBar() && headerIsAccount(targetLabel)) { openBot(manualTest); return; }
+        if (!hasMainTabBar()) {
+            navigateToMe(0, () -> verifySwitchedAccount(attempt + 1, manualTest),
+                    message -> finish(false, "无法核对切换后的账号：" + message));
+            return;
+        }
         if (attempt >= 3) {
             finish(false, "切换后无法验证当前账号，已阻止发送：" + targetLabel);
             return;
@@ -439,10 +481,10 @@ public class TurritAccessibilityService extends AccessibilityService {
             finish(false, "切换后无法确认顶部账号名称，未发送：" + targetLabel);
             return;
         }
-        after(590, () -> verifySwitchedAccount(attempt + 1, dryRun));
+        after(590, () -> verifySwitchedAccount(attempt + 1, manualTest));
     }
 
-    private void openBot(boolean dryRun) {
+    private void openBot(boolean manualTest) {
         if (!isTurritForeground()) { finish(false, "Turrit 不在前台"); return; }
         // 以前只 setPackage，若同一个 Turrit 应用有两个 tg:// 处理 Activity，
         // Android 会弹出两个都叫“Turrit”的「打开方式」选择框，导致自动化中断。
@@ -460,7 +502,7 @@ public class TurritAccessibilityService extends AccessibilityService {
         try { startActivity(intent); }
         catch (Exception e) { finish(false, "Turrit 无法打开机器人页面：" + e.getClass().getSimpleName()); return; }
         // 后续仍然校验机器人的顶部名称和聊天输入框，不会仅因打开了页面就发送。
-        after(1550, () -> verifyChat(0, dryRun));
+        after(1550, () -> verifyChat(0, manualTest));
     }
     /** 仅在 org.telegram.group 内选取支持 tg:// 的 Activity，避免弹出系统「打开方式」。 */
     private ComponentName selectTurritDeepLinkHandler(Intent viewIntent) {
@@ -503,19 +545,30 @@ public class TurritAccessibilityService extends AccessibilityService {
         return new ComponentName(Store.TURRIT_PKG, selected.activityInfo.name);
     }
 
-    private void verifyChat(int attempt, boolean dryRun) {
+    private void verifyChat(int attempt, boolean manualTest) {
         if (!isTurritForeground()) { finish(false, "打开机器人后，前台不是 Turrit"); return; }
         AccessibilityNodeInfo root = getRootInActiveWindow();
         // 不以聊天历史中的关键词作为验证。只检查顶部标题区域，防止发错人。
         AccessibilityNodeInfo title = findTextRec(root, expectedTitle, .035f, .22f, false);
         AccessibilityNodeInfo edit = editableAtBottom(root);
         if (title != null && edit != null) {
-            if (dryRun) { finish(true, "账号与机器人顶部标题已验证（未发送）"); return; }
             clearDraftAndSend(0);
             return;
         }
-        if (attempt < 5) { after(550, () -> verifyChat(attempt + 1, dryRun)); return; }
-        finish(false, "无法验证机器人顶部名称或输入框；请检查「顶部名称关键词」，未发送");
+        // Turrit 首次进入机器人可能只有「启动机器人」按钮，没有文字输入框。
+        // 只有顶部机器人标题明确匹配时才允许点击启动按钮，最多点击一次。
+        if (title != null && edit == null && !botStartTapped) {
+            AccessibilityNodeInfo start = findTextRec(root, "启动机器人", .79f, 1f, true);
+            if (start == null) start = findTextRec(root, "Start Bot", .79f, 1f, false);
+            if (start != null && click(start)) {
+                botStartTapped = true;
+                Store.get(this).log("已打开目标机器人的启动页，正在等待聊天输入框");
+                after(1200, () -> verifyChat(0, manualTest));
+                return;
+            }
+        }
+        if (attempt < 6) { after(600, () -> verifyChat(attempt + 1, manualTest)); return; }
+        finish(false, "无法验证机器人顶部标题和聊天输入框，或机器人启动后未出现输入框；未发送关键词");
     }
     private void clearDraftAndSend(int index) {
         AccessibilityNodeInfo edit = editableAtBottom(getRootInActiveWindow());
