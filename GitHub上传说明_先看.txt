@@ -1,0 +1,24 @@
+Turrit APK 项目 - GitHub 上传说明（防止多套一层目录）
+====================================================
+
+本压缩包已调整结构：打开压缩包直接看到 app、.github、build.gradle 等项目文件，
+没有外层 TurritMuMuAPK 目录。
+
+上传到 GitHub 的正确方法：
+1. 在 Windows 新建一个空文件夹，例如 D:\APK上传。
+2. 将本 ZIP 内的全部内容解压到该空文件夹。
+3. 双击进入该文件夹，检查里面直接有 app 文件夹、.github 文件夹、build.gradle 文件。
+4. 打开 GitHub 仓库 11 的根目录，点击 Add file → Upload files。
+5. 在 Windows 文件资源管理器中，按 Ctrl+A 全选解压出来的内容，
+   直接拖到网页上传区域（不要把外面的“APK上传”文件夹拖进去）。
+6. 点击 Commit changes。GitHub 仓库首页应直接显示 app、.github、build.gradle。
+7. 再进入 Actions → Build Turrit MuMu debug APK → Run workflow。
+8. 只有当构建出现绿色 ✓ 时，才能从 Artifacts 下载 APK。
+
+不要直接把 ZIP 上传到 GitHub：GitHub 不会自动解压 ZIP 作为项目源码。
+如果仓库已有旧的 TurritMuMuAPK 文件夹，可之后再删除；
+旧文件夹不会影响根目录下正确的 Actions 构建，但会重复占空间。
+
+重要：本项目仍为未经 MuMu/Turrit 实际安装验证的 v0.1 测试版源码，
+该压缩包仅解决 GitHub 上传时多一层文件夹的问题，
+不能保证 GitHub 构建一次成功或所有自动操作都正常。
