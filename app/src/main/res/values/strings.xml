@@ -1,4 +1,0 @@
-<resources>
-    <string name="app_name">TURRIT 任务助手</string>
-    <string name="accessibility_service_description">仅在你主动选择识别的 Turrit 应用中读取可见账号信息，用于显示登录账号。</string>
-</resources>
